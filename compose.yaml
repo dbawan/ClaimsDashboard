@@ -1,0 +1,27 @@
+services:
+  claim-lifecycle:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: united-theranostics/claim-lifecycle:local
+    init: true
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "${APP_PORT:-4200}:3000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    stop_grace_period: 10s

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.DS_Store
+npm-debug.log*
+claim_lifecycle_mysql_data.txt
+__pycache__/
+*.pyc

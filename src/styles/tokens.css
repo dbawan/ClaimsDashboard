@@ -1,0 +1,26 @@
+:root {
+  --salmon: #ed765f;
+  --salmon-dark: #d65f49;
+  --salmon-soft: #fff0eb;
+  --navy: #17324d;
+  --navy-deep: #10263b;
+  --ink: #121b23;
+  --muted: #66727d;
+  --line: #dfe4e8;
+  --surface: #ffffff;
+  --canvas: #f3f5f6;
+  --success: #28674c;
+  --success-soft: #e8f4ef;
+  --warning: #815113;
+  --warning-soft: #fff1d7;
+  --danger: #963d3d;
+  --danger-soft: #fff0f0;
+  --shadow-card: 0 7px 28px rgba(23, 50, 77, 0.05);
+  --shadow-raised: 0 15px 45px rgba(23, 50, 77, 0.08);
+  --shadow-modal: 0 30px 90px rgba(0, 0, 0, 0.32);
+  --radius-control: 7px;
+  --radius-button: 8px;
+  --radius-card: 10px;
+  --radius-large: 14px;
+}
+

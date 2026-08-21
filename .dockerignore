@@ -1,0 +1,15 @@
+.env
+.git
+.gitignore
+.DS_Store
+.codex
+.agents
+node_modules
+dist
+npm-debug.log*
+claim_lifecycle_mysql_data.txt
+claim_lifecycle_report.py
+__pycache__
+*.pyc
+*.txt
+
