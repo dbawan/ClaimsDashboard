@@ -1,15 +1,28 @@
 import { createPublicKey, randomBytes, timingSafeEqual, verify } from "node:crypto";
 import { config } from "../config.js";
+import {
+  ALL_PERMISSIONS,
+  loadUserPermissions,
+  provisionUserPermissions,
+} from "../permissions/userPermissions.js";
+import { InMemorySessionStore } from "./sessionStore.js";
 
 const COOKIE_NAMES = Object.freeze({
-  idToken: "ut_sso_id",
-  refreshToken: "ut_sso_refresh",
+  session: "ut_sso_session",
+  legacyIdToken: "ut_sso_id",
+  legacyRefreshToken: "ut_sso_refresh",
   state: "ut_sso_state",
   nonce: "ut_sso_nonce",
   returnTo: "ut_sso_return",
 });
 const LOGIN_COOKIE_SECONDS = 10 * 60;
 const JWKS_CACHE_MS = 60 * 60 * 1_000;
+const SESSION_SECONDS = config.sso.sessionDays * 24 * 60 * 60;
+
+const serverSessions = new InMemorySessionStore({
+  ttlMs: SESSION_SECONDS * 1_000,
+  maxSessions: config.sso.maxSessions,
+});
 
 let jwksCache = null;
 let jwksLoadedAt = 0;
@@ -43,7 +56,7 @@ export function parseCookies(header = "") {
 
 function serializeCookie(name, value, {
   maxAge,
-  path = "/",
+  path = config.appPath("/"),
   httpOnly = true,
   secure = config.sso.secureCookies,
   sameSite = "Lax",
@@ -60,26 +73,37 @@ function appendCookie(response, name, value, options) {
   response.append("Set-Cookie", serializeCookie(name, value, options));
 }
 
-function clearCookie(response, name, path = "/") {
+function clearCookie(response, name, path = config.appPath("/")) {
   appendCookie(response, name, "", { maxAge: 0, path });
 }
 
-export function clearSessionCookies(response) {
-  clearCookie(response, COOKIE_NAMES.idToken);
-  clearCookie(response, COOKIE_NAMES.refreshToken);
+export function clearSessionCookies(request, response) {
+  const cookies = parseCookies(request?.headers?.cookie);
+  serverSessions.delete(cookies[COOKIE_NAMES.session]);
+  clearCookie(response, COOKIE_NAMES.session);
+  clearCookie(response, COOKIE_NAMES.legacyIdToken);
+  clearCookie(response, COOKIE_NAMES.legacyRefreshToken);
 }
 
 function clearLoginCookies(response) {
-  clearCookie(response, COOKIE_NAMES.state, "/callback");
-  clearCookie(response, COOKIE_NAMES.nonce, "/callback");
-  clearCookie(response, COOKIE_NAMES.returnTo, "/callback");
+  const callbackPath = config.appPath("/callback");
+  clearCookie(response, COOKIE_NAMES.state, callbackPath);
+  clearCookie(response, COOKIE_NAMES.nonce, callbackPath);
+  clearCookie(response, COOKIE_NAMES.returnTo, callbackPath);
 }
 
 export function safeReturnTo(value) {
-  if (typeof value !== "string" || value.length > 2_048) return "/";
-  if (!value.startsWith("/") || value.startsWith("//")) return "/";
-  if (value === "/callback" || value.startsWith("/callback?")) return "/";
-  if (value.startsWith("/auth/")) return "/";
+  const homePath = config.appPath("/");
+  if (typeof value !== "string" || value.length > 2_048) return homePath;
+  if (!value.startsWith("/") || value.startsWith("//")) return homePath;
+  if (config.basePath
+    && value !== config.basePath
+    && !value.startsWith(`${config.basePath}/`)
+    && !value.startsWith(`${config.basePath}?`)
+    && !value.startsWith(`${config.basePath}#`)) return homePath;
+  const callbackPath = config.appPath("/callback");
+  if (value === callbackPath || value.startsWith(`${callbackPath}?`)) return homePath;
+  if (value.startsWith(config.appPath("/auth/"))) return homePath;
   return value;
 }
 
@@ -126,7 +150,7 @@ export function beginLogin(request, response) {
   assertSsoConfigured();
   const canonicalHost = new URL(config.appOrigin).host;
   if (request.get("host") !== canonicalHost) {
-    const canonicalLogin = new URL("/auth/login", config.appOrigin);
+    const canonicalLogin = new URL(config.appPath("/auth/login"), `${config.appOrigin}/`);
     canonicalLogin.searchParams.set("returnTo", safeReturnTo(request.query.returnTo));
     response.redirect(302, canonicalLogin.toString());
     return;
@@ -134,7 +158,7 @@ export function beginLogin(request, response) {
   const state = randomUrlSafeValue();
   const nonce = randomUrlSafeValue();
   const returnTo = safeReturnTo(request.query.returnTo);
-  const cookieOptions = { maxAge: LOGIN_COOKIE_SECONDS, path: "/callback" };
+  const cookieOptions = { maxAge: LOGIN_COOKIE_SECONDS, path: config.appPath("/callback") };
 
   appendCookie(response, COOKIE_NAMES.state, state, cookieOptions);
   appendCookie(response, COOKIE_NAMES.nonce, nonce, cookieOptions);
@@ -261,7 +285,8 @@ export async function verifyIdToken(token, { nonce } = {}) {
   const payload = decoded.payload;
   if (payload.iss !== config.sso.issuer
     || payload.token_use !== "id"
-    || payload.aud !== config.sso.clientId) {
+    || payload.aud !== config.sso.clientId
+    || !payload.sub) {
     throw new AuthError("The SSO token was not issued for this application.", { code: "INVALID_SSO_TOKEN" });
   }
   if (!Number.isFinite(payload.exp) || payload.exp <= now) {
@@ -293,6 +318,14 @@ function publicUser(payload) {
     site: payload.site || null,
     role: userRole(groups),
     groups,
+  };
+}
+
+async function userWithPermissions(payload) {
+  const user = publicUser(payload);
+  return {
+    ...user,
+    permissions: await loadUserPermissions(user.id),
   };
 }
 
@@ -341,17 +374,15 @@ async function refreshSession(refreshToken) {
   });
 }
 
-function storeSessionCookies(response, tokens, payload, existingRefreshToken = "") {
-  const now = Math.floor(Date.now() / 1_000);
-  appendCookie(response, COOKIE_NAMES.idToken, tokens.id_token, {
-    maxAge: Math.max(1, payload.exp - now),
+export function createBrowserSession(response, tokens, previousSessionId = "") {
+  serverSessions.delete(previousSessionId);
+  const sessionId = serverSessions.create({
+    idToken: tokens.id_token,
+    refreshToken: tokens.refresh_token || "",
   });
-  const refreshToken = tokens.refresh_token || existingRefreshToken;
-  if (refreshToken) {
-    appendCookie(response, COOKIE_NAMES.refreshToken, refreshToken, {
-      maxAge: config.sso.refreshCookieDays * 24 * 60 * 60,
-    });
-  }
+  appendCookie(response, COOKIE_NAMES.session, sessionId, { maxAge: SESSION_SECONDS });
+  clearCookie(response, COOKIE_NAMES.legacyIdToken);
+  clearCookie(response, COOKIE_NAMES.legacyRefreshToken);
 }
 
 export async function completeLogin(request, response) {
@@ -362,7 +393,7 @@ export async function completeLogin(request, response) {
   const providerError = typeof request.query.error_description === "string"
     ? request.query.error_description
     : request.query.error;
-  let returnTo = "/";
+  let returnTo = config.appPath("/");
 
   try {
     if (providerError) {
@@ -381,7 +412,8 @@ export async function completeLogin(request, response) {
     const payload = await verifyIdToken(tokens.id_token, {
       nonce: cookies[COOKIE_NAMES.nonce],
     });
-    storeSessionCookies(response, tokens, payload);
+    await provisionUserPermissions(payload.sub);
+    createBrowserSession(response, tokens, cookies[COOKIE_NAMES.session]);
     returnTo = safeReturnTo(cookies[COOKIE_NAMES.returnTo]);
   } finally {
     clearLoginCookies(response);
@@ -391,30 +423,43 @@ export async function completeLogin(request, response) {
 
 async function authenticatedUser(request, response) {
   if (!config.sso.enabled) {
-    return { id: "local", name: "Local development", email: null, site: null, role: "admin", groups: [] };
+    return {
+      id: "local",
+      name: "Local development",
+      email: null,
+      site: null,
+      role: "admin",
+      groups: [],
+      permissions: ALL_PERMISSIONS,
+    };
   }
   assertSsoConfigured();
 
   const authorization = String(request.headers.authorization || "");
   const bearerMatch = authorization.match(/^Bearer\s+(.+)$/i);
-  if (bearerMatch) return publicUser(await verifyIdToken(bearerMatch[1]));
+  if (bearerMatch) return userWithPermissions(await verifyIdToken(bearerMatch[1]));
 
   const cookies = parseCookies(request.headers.cookie);
-  const idToken = cookies[COOKIE_NAMES.idToken];
-  if (idToken) {
+  const sessionId = cookies[COOKIE_NAMES.session];
+  const session = serverSessions.get(sessionId);
+  if (!session) throw new AuthError("An SSO session is required.");
+
+  if (session.idToken) {
     try {
-      return publicUser(await verifyIdToken(idToken));
+      return userWithPermissions(await verifyIdToken(session.idToken));
     } catch (error) {
       if (error.code !== "SSO_TOKEN_EXPIRED") throw error;
     }
   }
 
-  const refreshToken = cookies[COOKIE_NAMES.refreshToken];
-  if (!refreshToken) throw new AuthError("An SSO session is required.");
-  const tokens = await refreshSession(refreshToken);
+  if (!session.refreshToken) throw new AuthError("The SSO session has expired.");
+  const tokens = await refreshSession(session.refreshToken);
   const payload = await verifyIdToken(tokens.id_token);
-  storeSessionCookies(response, tokens, payload, refreshToken);
-  return publicUser(payload);
+  serverSessions.update(sessionId, {
+    idToken: tokens.id_token,
+    refreshToken: tokens.refresh_token || session.refreshToken,
+  });
+  return userWithPermissions(payload);
 }
 
 export async function requireSso(request, response, next) {
@@ -422,7 +467,7 @@ export async function requireSso(request, response, next) {
     request.user = await authenticatedUser(request, response);
     next();
   } catch (error) {
-    if (error.statusCode === 401 || error.statusCode === 403) clearSessionCookies(response);
+    if (error.statusCode === 401 || error.statusCode === 403) clearSessionCookies(request, response);
     next(error);
   }
 }
@@ -432,15 +477,15 @@ export async function readSession(request, response) {
     const user = await authenticatedUser(request, response);
     response.json({ authenticated: true, user });
   } catch (error) {
-    if (error.statusCode === 401 || error.statusCode === 403) clearSessionCookies(response);
+    if (error.statusCode === 401 || error.statusCode === 403) clearSessionCookies(request, response);
     throw error;
   }
 }
 
-export function endSession(response) {
-  clearSessionCookies(response);
+export function endSession(request, response) {
+  clearSessionCookies(request, response);
   if (!config.sso.enabled || !config.sso.configured) {
-    response.redirect(302, config.appOrigin);
+    response.redirect(302, config.appUrl);
     return;
   }
   response.redirect(302, buildLogoutUrl(config.sso));

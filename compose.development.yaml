@@ -1,0 +1,11 @@
+services:
+  profile:
+    build:
+      args:
+        APP_BASE_PATH: "${DEVELOPMENT_APP_BASE_PATH-}"
+    environment:
+      APP_ENV: development
+      APP_ORIGIN: "${DEVELOPMENT_APP_ORIGIN:-http://localhost:4200}"
+      APP_BASE_PATH: "${DEVELOPMENT_APP_BASE_PATH-}"
+    ports:
+      - "127.0.0.1:${DEVELOPMENT_PORT:-4200}:3000"

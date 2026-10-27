@@ -1,4 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { PatientClaimLookupPanel } from "./PatientClaimLookupPanel.jsx";
+import { ClaimDiagnosisPanel } from "./ClaimDiagnosisPanel.jsx";
+import { ClaimWorklistPanel } from "./ClaimWorklistPanel.jsx";
+import { createSalesforceClaimNote } from "./api.js";
 
 const commentDateTime = new Intl.DateTimeFormat("en-US", {
   month: "short",
@@ -45,14 +49,6 @@ function titleCase(value) {
     .replace(/\b\w/g, (letter) => letter.toLocaleUpperCase());
 }
 
-function commentPreview(comment) {
-  return comment.summary
-    || comment.text
-    || comment.action
-    || comment.followUpAction
-    || "Salesforce activity was recorded for this claim.";
-}
-
 function financialDetails(comment) {
   return [
     ["Paid", formatMoney(comment.paid)],
@@ -85,48 +81,90 @@ function allocationCountLabel(allocations) {
 }
 
 function DockTab({ kind, label, countLabel, onOpen, tabRef }) {
+  const icon = kind === "invoices" ? "▤" : "•••";
   return (
     <button ref={tabRef} className="claim-dock-tab" type="button" onClick={onOpen} aria-expanded="false">
-      <span className="claim-dock-tab-icon" aria-hidden="true">{kind === "invoices" ? "▤" : "•••"}</span>
+      <span className="claim-dock-tab-icon" aria-hidden="true">{icon}</span>
       <span><strong>{label}</strong><small>{countLabel}</small></span>
       <i aria-hidden="true">⌃</i>
     </button>
   );
 }
 
-function PreviewShell({ kind, title, countLabel, onExpand, onCollapse, children, previewRef }) {
-  return (
-    <div className="claim-dock-preview">
-      <button
-        ref={previewRef}
-        className="claim-dock-preview-main"
-        type="button"
-        onClick={onExpand}
-        aria-expanded="false"
-      >
-        <span className="claim-dock-preview-icon" aria-hidden="true">{kind === "invoices" ? "▤" : "•••"}</span>
-        <span className="claim-dock-preview-copy">
-          <span className="claim-dock-preview-title"><span>{title}</span><strong>{countLabel}</strong></span>
-          {children}
-        </span>
-        <span className="claim-dock-preview-open" aria-hidden="true">↗</span>
-      </button>
-      <button className="claim-dock-collapse" type="button" onClick={onCollapse} aria-label={`Collapse ${title}`}>⌄</button>
-    </div>
-  );
-}
-
-function CommentsPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, tabRef, previewRef }) {
+function CommentsPanel({
+  data,
+  mode,
+  inactive,
+  onAdvance,
+  onCollapse,
+  onRefresh,
+  closeRef,
+  tabRef,
+}) {
   const comments = useMemo(() => [...(data.comments || [])].sort((left, right) => {
     const leftKey = left.createdAt || left.date || "";
     const rightKey = right.createdAt || right.date || "";
     return rightKey.localeCompare(leftKey) || Number(right.sequence || 0) - Number(left.sequence || 0);
   }), [data.comments]);
   const integration = data.commentIntegration || {};
-  const countLabel = commentCountLabel(integration, comments.length);
+  const refreshing = Boolean(data.realtimePending);
+  const countLabel = refreshing ? "Refreshing…" : commentCountLabel(integration, comments.length);
+  const canCreateNote = Boolean(data.access?.salesforceNoteCreate);
+  const noteMaxChars = Number(data.access?.salesforceNoteMaxChars) || 5_000;
+  const [noteText, setNoteText] = useState("");
+  const [confirmed, setConfirmed] = useState(false);
+  const [submission, setSubmission] = useState({ status: "idle", message: "" });
+  const noteRequestKeyRef = useRef("");
   const caseStatus = data.claim?.salesforceStatus
     || comments.find((comment) => comment.caseStatus)?.caseStatus
     || "Status unavailable";
+
+  useEffect(() => {
+    setNoteText("");
+    setConfirmed(false);
+    setSubmission({ status: "idle", message: "" });
+    noteRequestKeyRef.current = "";
+  }, [data.claim?.claimId]);
+
+  function updateNoteText(value) {
+    setNoteText(value);
+    setConfirmed(false);
+    setSubmission({ status: "idle", message: "" });
+    noteRequestKeyRef.current = "";
+  }
+
+  async function submitNote(event) {
+    event.preventDefault();
+    if (!confirmed || !noteText.trim() || ["submitting", "uncertain"].includes(submission.status)) return;
+
+    noteRequestKeyRef.current ||= window.crypto.randomUUID();
+    setSubmission({ status: "submitting", message: "Creating a new Salesforce note…" });
+    try {
+      const result = await createSalesforceClaimNote(data.claim.claimId, noteText, {
+        idempotencyKey: noteRequestKeyRef.current,
+      });
+      noteRequestKeyRef.current = "";
+      setNoteText("");
+      setConfirmed(false);
+      try {
+        await onRefresh?.();
+        setSubmission({
+          status: "created",
+          message: `Salesforce confirmed note ${result.noteId}. The comment feed has been refreshed.`,
+        });
+      } catch {
+        setSubmission({
+          status: "created",
+          message: `Salesforce confirmed note ${result.noteId}. The feed could not refresh, but do not submit the note again.`,
+        });
+      }
+    } catch (error) {
+      setSubmission({
+        status: error.code === "SALESFORCE_NOTE_RESULT_UNCERTAIN" ? "uncertain" : "error",
+        message: error.message || "The Salesforce note could not be created.",
+      });
+    }
+  }
 
   return (
     <aside
@@ -147,28 +185,6 @@ function CommentsPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, 
         />
       ) : null}
 
-      {mode === "preview" ? (
-        <PreviewShell
-          kind="comments"
-          title="Salesforce comments"
-          countLabel={countLabel}
-          onExpand={onAdvance}
-          onCollapse={onCollapse}
-          previewRef={previewRef}
-        >
-          {comments.length ? comments.slice(0, 2).map((comment) => (
-            <span className="claim-dock-preview-line" key={comment.commentId}>
-              <small>{formatCommentDate(comment.createdAt || comment.date)}</small>
-              <span>{commentPreview(comment)}</span>
-            </span>
-          )) : (
-            <span className="claim-dock-preview-empty">
-              {integration.message || "No Salesforce comments are attached to this claim."}
-            </span>
-          )}
-        </PreviewShell>
-      ) : null}
-
       {mode === "expanded" ? (
         <div className="claim-dock-expanded">
           <header className="claim-dock-header">
@@ -177,7 +193,7 @@ function CommentsPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, 
               <h2 id="claim-comments-heading">Comments for claim {data.claim?.claimId}</h2>
               <span className="claim-dock-status"><i aria-hidden="true" /> {caseStatus} · {countLabel}</span>
             </div>
-            <button ref={closeRef} type="button" onClick={onCollapse} aria-label="Return to comment preview">×</button>
+            <button ref={closeRef} type="button" onClick={onCollapse} aria-label="Close Salesforce comments">×</button>
           </header>
           <div className="claim-dock-scroll">
             {integration.message ? (
@@ -186,7 +202,62 @@ function CommentsPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, 
                 <span>{integration.message}</span>
               </div>
             ) : null}
-            {comments.length ? (
+            {canCreateNote ? (
+              <form className="salesforce-note-composer" onSubmit={submitNote}>
+                <div className="salesforce-note-composer-heading">
+                  <div>
+                    <strong>Add a new Salesforce note</strong>
+                    <span>Creates one note on the uniquely matched claim ticket. The note includes your verified signed-in identity and identifies the Claim Lifecycle application as its source.</span>
+                  </div>
+                  <em>{noteText.length.toLocaleString("en-US")} / {noteMaxChars.toLocaleString("en-US")}</em>
+                </div>
+                <label htmlFor="salesforce-note-text">Message</label>
+                <textarea
+                  id="salesforce-note-text"
+                  value={noteText}
+                  maxLength={noteMaxChars}
+                  rows="5"
+                  placeholder="Enter the message that should appear on this claim ticket…"
+                  disabled={["submitting", "uncertain"].includes(submission.status)}
+                  onChange={(event) => updateNoteText(event.target.value)}
+                />
+                <label className="salesforce-note-confirmation">
+                  <input
+                    type="checkbox"
+                    checked={confirmed}
+                    disabled={!noteText.trim() || ["submitting", "uncertain"].includes(submission.status)}
+                    onChange={(event) => setConfirmed(event.target.checked)}
+                  />
+                  <span>
+                    I confirm this message belongs on the Salesforce ticket for claim <strong>{data.claim.claimId}</strong>.
+                    This dashboard cannot undo it after Salesforce accepts it.
+                  </span>
+                </label>
+                <div className="salesforce-note-submit-row">
+                  <button
+                    type="submit"
+                    disabled={!confirmed || !noteText.trim() || ["submitting", "uncertain"].includes(submission.status)}
+                  >
+                    {submission.status === "submitting" ? "Posting…" : "Post new note to Salesforce"}
+                  </button>
+                  <small>One create request only · no claim updates · no note edits</small>
+                </div>
+                {submission.status !== "idle" ? (
+                  <p
+                    className={`salesforce-note-result salesforce-note-result-${submission.status}`}
+                    role={["error", "uncertain"].includes(submission.status) ? "alert" : "status"}
+                  >
+                    {submission.message}
+                  </p>
+                ) : null}
+              </form>
+            ) : null}
+            {refreshing && !comments.length ? (
+              <DockEmpty
+                title="Refreshing Salesforce comments"
+                message="Loading the latest claim activity directly from Salesforce."
+              />
+            ) : comments.length ? (
               <ol className="claim-comments-list" aria-label="Salesforce comments, newest first">
                 {comments.map((comment) => {
                   const details = financialDetails(comment);
@@ -219,8 +290,8 @@ function CommentsPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, 
             ) : <DockEmpty title={countLabel} message={integration.message} />}
           </div>
           <footer className="claim-dock-footer">
-            <span><i aria-hidden="true" /> Query-only connection</span>
-            <small>Newest activity first · Salesforce is never modified</small>
+            <span><i aria-hidden="true" /> {canCreateNote ? "Create-only note access" : "Query-only connection"}</span>
+            <small>{canCreateNote ? "New notes only · claims and existing notes cannot be changed" : "Newest activity first · Salesforce is never modified"}</small>
           </footer>
         </div>
       ) : null}
@@ -333,7 +404,7 @@ function DockEmpty({ title, message }) {
   );
 }
 
-function InvoicesPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, tabRef, previewRef }) {
+function InvoicesPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, tabRef }) {
   const invoices = data.patientInvoices || [];
   const integration = data.invoiceIntegration || {};
   const allocations = integration.allocations || [];
@@ -344,8 +415,6 @@ function InvoicesPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, 
     : allocations.length
       ? allocationCountLabel(allocations)
       : invoiceCountLabel(invoices.length);
-  const previewInvoices = individuallyMatchedInvoices.slice(0, 2);
-  const previewAllocations = allocations.slice(0, 2);
   const estimatedAllocation = allocations.find(({ status }) => status === "estimated_equal_pool");
   const usedCptFallback = integration.matchMethod === "service_date_and_cpt";
   const usedDateOnlyFallback = integration.matchMethod === "service_date_only";
@@ -380,51 +449,18 @@ function InvoicesPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, 
         />
       ) : null}
 
-      {mode === "preview" ? (
-        <PreviewShell
-          kind="invoices"
-          title="Patient invoices"
-          countLabel={countLabel}
-          onExpand={onAdvance}
-          onCollapse={onCollapse}
-          previewRef={previewRef}
-        >
-          {estimatedAllocation ? (
-            <span className="claim-dock-preview-warning">
-              ≈ {estimatedAllocation.shareNumerator}/{estimatedAllocation.shareDenominator} equal-pool estimate · not confirmed
-            </span>
-          ) : integration.isAmbiguous ? (
-            <span className="claim-dock-preview-warning">⚑ Multiple claims share this invoice pool</span>
-          ) : null}
-          {previewAllocations.length ? previewAllocations.map((allocation) => (
-            <span className="claim-dock-preview-line" key={allocation.id}>
-              <small>{formatDate(allocation.serviceDate)}</small>
-              <span>{allocation.product || "Unresolved invoice pool"} · {allocation.invoiceCount} invoices / {allocation.claimCount} claims</span>
-              <strong>{formatMoney(allocation.estimatedAmount) || "Review"}</strong>
-            </span>
-          )) : previewInvoices.length ? previewInvoices.map((invoice) => (
-            <span className="claim-dock-preview-line" key={invoice.id}>
-              <small>{formatDate(invoice.dateOfService)}</small>
-              <span>#{invoice.invoiceNumber || "—"} · {invoice.lines[0] ? invoiceLineTitle(invoice.lines[0]) : titleCase(invoice.vendor)}</span>
-              <strong>{formatMoney(invoice.total) || "—"}</strong>
-            </span>
-          )) : (
-            <span className="claim-dock-preview-empty">
-              {integration.message || "No exact patient and service-date invoice match was found."}
-            </span>
-          )}
-        </PreviewShell>
-      ) : null}
-
       {mode === "expanded" ? (
         <div className="claim-dock-expanded">
           <header className="claim-dock-header">
             <div>
               <p>{invoiceMatchHeading}</p>
               <h2 id="claim-invoices-heading">Invoices for claim {data.claim?.claimId}</h2>
-              <span className="claim-dock-status"><i aria-hidden="true" /> {data.claim?.patientName} · {countLabel}</span>
+              <span className="claim-dock-status">
+                <i aria-hidden="true" />
+                {data.claim?.patientName ? `${data.claim.patientName} · ` : ""}{countLabel}
+              </span>
             </div>
-            <button ref={closeRef} type="button" onClick={onCollapse} aria-label="Return to invoice preview">×</button>
+            <button ref={closeRef} type="button" onClick={onCollapse} aria-label="Close patient invoices">×</button>
           </header>
           <div className="claim-dock-scroll">
             <div className={`claim-dock-integration claim-dock-integration-${integration.status || "unknown"}`}>
@@ -448,19 +484,31 @@ function InvoicesPanel({ data, mode, inactive, onAdvance, onCollapse, closeRef, 
   );
 }
 
-export function ClaimBottomDock({ data }) {
-  const [modes, setModes] = useState({ invoices: "collapsed", comments: "collapsed" });
+export function ClaimBottomDock({ data, onRefresh }) {
+  const [modes, setModes] = useState({
+    invoices: "collapsed",
+    patientLookup: "collapsed",
+    diagnosis: "collapsed",
+    worklist: "collapsed",
+    comments: "collapsed",
+  });
   const layerRef = useRef(null);
   const commentsTabRef = useRef(null);
-  const commentsPreviewRef = useRef(null);
+  const diagnosisTabRef = useRef(null);
+  const worklistTabRef = useRef(null);
   const invoicesTabRef = useRef(null);
-  const invoicesPreviewRef = useRef(null);
+  const patientLookupTabRef = useRef(null);
   const expandedCloseRef = useRef(null);
   const expandedPanel = Object.entries(modes).find(([, mode]) => mode === "expanded")?.[0] || null;
-  const previewPanel = Object.entries(modes).find(([, mode]) => mode === "preview")?.[0] || null;
 
   useEffect(() => {
-    setModes({ invoices: "collapsed", comments: "collapsed" });
+    setModes({
+      invoices: "collapsed",
+      patientLookup: "collapsed",
+      diagnosis: "collapsed",
+      worklist: "collapsed",
+      comments: "collapsed",
+    });
   }, [data.claim?.claimId]);
 
   useEffect(() => {
@@ -470,15 +518,24 @@ export function ClaimBottomDock({ data }) {
     function handleKeyDown(event) {
       if (event.key === "Escape") {
         event.preventDefault();
-        setModes((current) => ({ ...current, [expandedPanel]: "preview" }));
+        setModes((current) => ({ ...current, [expandedPanel]: "collapsed" }));
         window.requestAnimationFrame(() => {
-          (expandedPanel === "comments" ? commentsPreviewRef : invoicesPreviewRef).current?.focus();
+          const reference = expandedPanel === "patientLookup"
+            ? patientLookupTabRef
+            : expandedPanel === "diagnosis"
+              ? diagnosisTabRef
+            : expandedPanel === "worklist"
+              ? worklistTabRef
+            : expandedPanel === "comments" ? commentsTabRef : invoicesTabRef;
+          reference.current?.focus();
         });
         return;
       }
       if (event.key !== "Tab") return;
       const panel = layerRef.current?.querySelector(".claim-dock-panel-expanded");
-      const focusable = [...(panel?.querySelectorAll("button, [href], [tabindex]:not([tabindex='-1'])") || [])];
+      const focusable = [...(panel?.querySelectorAll(
+        "button, input, select, textarea, [href], [tabindex]:not([tabindex='-1'])",
+      ) || [])].filter((element) => !element.disabled);
       if (!focusable.length) return;
       const first = focusable[0];
       const last = focusable.at(-1);
@@ -498,20 +555,26 @@ export function ClaimBottomDock({ data }) {
   function setPanelMode(panel, mode) {
     setModes({
       invoices: panel === "invoices" ? mode : "collapsed",
+      patientLookup: panel === "patientLookup" ? mode : "collapsed",
+      diagnosis: panel === "diagnosis" ? mode : "collapsed",
+      worklist: panel === "worklist" ? mode : "collapsed",
       comments: panel === "comments" ? mode : "collapsed",
     });
   }
 
   function advance(panel) {
-    setPanelMode(panel, modes[panel] === "collapsed" ? "preview" : "expanded");
+    setPanelMode(panel, "expanded");
   }
 
   function collapse(panel) {
-    const nextMode = modes[panel] === "expanded" ? "preview" : "collapsed";
-    setPanelMode(panel, nextMode);
+    setPanelMode(panel, "collapsed");
     window.requestAnimationFrame(() => {
-      const reference = nextMode === "preview"
-        ? panel === "comments" ? commentsPreviewRef : invoicesPreviewRef
+      const reference = panel === "patientLookup"
+        ? patientLookupTabRef
+        : panel === "diagnosis"
+          ? diagnosisTabRef
+        : panel === "worklist"
+          ? worklistTabRef
         : panel === "comments" ? commentsTabRef : invoicesTabRef;
       reference.current?.focus();
     });
@@ -520,36 +583,72 @@ export function ClaimBottomDock({ data }) {
   return (
     <div
       ref={layerRef}
-      className={`claim-dock-layer${expandedPanel ? ` claim-dock-has-expanded claim-dock-active-${expandedPanel}` : ""}${previewPanel ? ` claim-dock-has-preview claim-dock-active-${previewPanel}` : ""}`}
+      className={`claim-dock-layer${data.access?.claimOverview ? " claim-dock-has-patient-lookup" : ""}${expandedPanel ? ` claim-dock-has-expanded claim-dock-active-${expandedPanel}` : ""}`}
     >
       <button
         className="claim-dock-backdrop"
         type="button"
-        aria-label={`Return to ${expandedPanel || "claim activity"} preview`}
+        aria-label={`Close ${expandedPanel || "claim activity"} panel`}
         aria-hidden="true"
         tabIndex={-1}
         onClick={() => expandedPanel && collapse(expandedPanel)}
       />
-      <InvoicesPanel
-        data={data}
-        mode={modes.invoices}
-        inactive={Boolean(expandedPanel && expandedPanel !== "invoices")}
-        onAdvance={() => advance("invoices")}
-        onCollapse={() => collapse("invoices")}
-        closeRef={expandedPanel === "invoices" ? expandedCloseRef : undefined}
-        tabRef={invoicesTabRef}
-        previewRef={invoicesPreviewRef}
-      />
-      <CommentsPanel
-        data={data}
-        mode={modes.comments}
-        inactive={Boolean(expandedPanel && expandedPanel !== "comments")}
-        onAdvance={() => advance("comments")}
-        onCollapse={() => collapse("comments")}
-        closeRef={expandedPanel === "comments" ? expandedCloseRef : undefined}
-        tabRef={commentsTabRef}
-        previewRef={commentsPreviewRef}
-      />
+      {data.access?.supportingRecords ? (
+        <InvoicesPanel
+          data={data}
+          mode={modes.invoices}
+          inactive={Boolean(expandedPanel && expandedPanel !== "invoices")}
+          onAdvance={() => advance("invoices")}
+          onCollapse={() => collapse("invoices")}
+          closeRef={expandedPanel === "invoices" ? expandedCloseRef : undefined}
+          tabRef={invoicesTabRef}
+        />
+      ) : null}
+      {data.access?.claimOverview ? (
+        <PatientClaimLookupPanel
+          data={data}
+          mode={modes.patientLookup}
+          inactive={Boolean(expandedPanel && expandedPanel !== "patientLookup")}
+          onOpen={() => advance("patientLookup")}
+          onCollapse={() => collapse("patientLookup")}
+          closeRef={expandedPanel === "patientLookup" ? expandedCloseRef : undefined}
+          tabRef={patientLookupTabRef}
+        />
+      ) : null}
+      {data.access?.worklistAccess || data.access?.worklistManagement ? (
+        <ClaimWorklistPanel
+          data={data}
+          mode={modes.worklist}
+          inactive={Boolean(expandedPanel && expandedPanel !== "worklist")}
+          onOpen={() => advance("worklist")}
+          onCollapse={() => collapse("worklist")}
+          closeRef={expandedPanel === "worklist" ? expandedCloseRef : undefined}
+          tabRef={worklistTabRef}
+        />
+      ) : null}
+      {data.access?.worklistManagement ? (
+        <ClaimDiagnosisPanel
+          data={data}
+          mode={modes.diagnosis}
+          inactive={Boolean(expandedPanel && expandedPanel !== "diagnosis")}
+          onOpen={() => advance("diagnosis")}
+          onCollapse={() => collapse("diagnosis")}
+          closeRef={expandedPanel === "diagnosis" ? expandedCloseRef : undefined}
+          tabRef={diagnosisTabRef}
+        />
+      ) : null}
+      {data.access?.supportingRecords ? (
+        <CommentsPanel
+          data={data}
+          mode={modes.comments}
+          inactive={Boolean(expandedPanel && expandedPanel !== "comments")}
+          onAdvance={() => advance("comments")}
+          onCollapse={() => collapse("comments")}
+          onRefresh={onRefresh}
+          closeRef={expandedPanel === "comments" ? expandedCloseRef : undefined}
+          tabRef={commentsTabRef}
+        />
+      ) : null}
     </div>
   );
 }

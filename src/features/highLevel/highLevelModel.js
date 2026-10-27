@@ -3,7 +3,9 @@ export const STATUS_LABELS = Object.freeze({
   submitted: "Submitted",
   pending: "Pending",
   action: "Action needed",
-  paid: "Paid",
+  paid: "Posted payment",
+  received: "Payment received",
+  "receipt-reversed": "Received payment reversed",
   reversed: "Reversed",
   processed: "Processed",
   activity: "Activity",
@@ -71,6 +73,8 @@ export function eventIndexForPosition(percent, count) {
 
 export function nextTrackStatus(event, previous) {
   if (event.status === "submitted") return "pending";
+  if (event.status === "received") return previous === "paid" ? previous : "received";
+  if (event.status === "receipt-reversed") return "action";
   if (event.status === "reversed") return "action";
   if (event.status === "processed") return previous === "paid" ? "paid" : "action";
   if (event.status === "activity") return previous;
@@ -113,6 +117,17 @@ function numberValue(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
+export function cptPaymentProgress(row) {
+  const charge = row.latestCharge == null ? null : numberValue(row.latestCharge);
+  const posted = numberValue(row.posted);
+  const percent = charge > 0 ? (posted / charge) * 100 : null;
+  return {
+    percent,
+    width: percent == null ? 0 : Math.max(0, Math.min(100, percent)),
+    excess: charge > 0 ? Math.round(Math.max(0, posted - charge) * 100) / 100 : 0,
+  };
+}
+
 export function buildHoverSnapshot(claim, date) {
   const events = claim.events.filter((event) => event.date <= date);
   let status = "created";
@@ -127,8 +142,8 @@ export function buildHoverSnapshot(claim, date) {
     }
     const procedure = procedures.get(event.procedure);
     if (event.charge != null) procedure.charge = Math.max(procedure.charge, numberValue(event.charge));
-    if (["paid", "reversed"].includes(event.status) && event.amount != null) {
-      const paymentKey = [event.date, event.procedure, event.status, event.amount].join("|");
+    if (["paid", "reversed"].includes(event.status) && event.source !== "payer" && event.amount != null) {
+      const paymentKey = event.id || [event.date, event.procedure, event.status, event.amount, event.source].join("|");
       if (!paymentKeys.has(paymentKey)) {
         procedure.paid += numberValue(event.amount);
         paymentKeys.add(paymentKey);

@@ -3,11 +3,14 @@ import { requireSso } from "./auth/cognito.js";
 import { authRouter, callbackHandler, sessionHandler } from "./routes/auth.js";
 import { claimsRouter } from "./routes/claims.js";
 import { highLevelRouter } from "./routes/highLevel.js";
+import { createRequestLogger } from "./lib/requestLogger.js";
+import { config } from "./config.js";
 
 export function createApp() {
   const app = express();
 
   app.disable("x-powered-by");
+  app.use(createRequestLogger());
   app.use((request, response, next) => {
     response.set({
       "Cache-Control": "no-store",
@@ -19,22 +22,27 @@ export function createApp() {
     next();
   });
 
-  app.use("/auth", authRouter);
-  app.get("/callback", callbackHandler);
+  app.use(config.appPath("/auth"), authRouter);
+  app.get(config.appPath("/callback"), callbackHandler);
 
-  app.get("/api/health", (request, response) => {
-    response.json({ status: "ok", mode: "read-only" });
+  app.get(config.appPath("/api/health"), (request, response) => {
+    response.json({
+      status: "ok",
+      mode: config.salesforce.noteWritesEnabled
+        ? "worklists-and-salesforce-note-writes"
+        : "worklist-writes",
+    });
   });
-  app.get("/api/auth/session", sessionHandler);
-  app.use("/api", requireSso);
-  app.use("/api/high-level", highLevelRouter);
-  app.use("/api/claims", claimsRouter);
+  app.get(config.appPath("/api/auth/session"), sessionHandler);
+  app.use(config.appPath("/api"), requireSso);
+  app.use(config.appPath("/api/high-level"), highLevelRouter);
+  app.use(config.appPath("/api/claims"), claimsRouter);
 
-  app.all("/api/{*path}", (request, response) => {
+  app.all(`${config.appPath("/api")}/{*path}`, (request, response) => {
     if (request.method !== "GET") {
       response.status(405).json({
-        code: "READ_ONLY_API",
-        message: "This application exposes read-only GET endpoints only.",
+        code: "METHOD_NOT_ALLOWED",
+        message: "That API method is not available.",
       });
       return;
     }
@@ -57,7 +65,7 @@ export function createApp() {
           : error.message,
     };
     if (error.claimIds) body.claimIds = error.claimIds;
-    if (status >= 500) console.error("Claim search failed:", error.message);
+    if (status >= 500) console.error("API request failed:", error.message);
     response.status(status).json(body);
   });
 

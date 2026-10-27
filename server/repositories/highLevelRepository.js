@@ -1,3 +1,6 @@
+import { readAdvancedMdEra } from "./advancedMdEraRepository.js";
+import { readPostedPayments } from "./postedPaymentRepository.js";
+import { advancedMdEraRows, distinctEraRows } from "../lib/eraReconciliation.js";
 import { config } from "../config.js";
 import {
   encounterCandidateFromEraReference,
@@ -25,6 +28,18 @@ const CLAIM_SORT_SQL = Object.freeze({
   oldest: "serviceDate ASC, lastActivity ASC, claimId ASC",
   billed: "billedAmount DESC, serviceDate DESC, claimId ASC",
 });
+const ICU_SORT_SQL = Object.freeze({
+  deadline: "deadlineDate ASC, prioritizedCptChargedAmount DESC, claimId ASC",
+  "cpt-charged": "prioritizedCptChargedAmount DESC, deadlineDate ASC, claimId ASC",
+  charged: "chargedAmount DESC, deadlineDate ASC, claimId ASC",
+});
+
+const ICU_RESET_EVENT_SQL = `UPPER(REPLACE(REPLACE(REPLACE(
+  TRIM(COALESCE(CLAIMTRANSACTIONTYPENAME, '')), '-', ''), ' ', ''), '_', '')) IN (
+    'REBILLED', 'REBILLEDCLAIM', 'CLAIMREBILLED',
+    'CORRECTEDCLAIM', 'CLAIMCORRECTED', 'RESUBMITTEDCLAIM', 'CLAIMRESUBMITTED',
+    'APPEALSUBMITTED', 'SUBMITTEDAPPEAL', 'APPEALFILED', 'FILEDAPPEAL', 'APPEALSENT'
+  )`;
 
 function text(value) {
   return String(value ?? "").trim();
@@ -45,6 +60,95 @@ function numberValue(value) {
 
 function compact(values) {
   return [...new Set(values.map(text).filter(Boolean))];
+}
+
+function icuClaimSummarySql({ recentOnly = true, procedureQuery = "" } = {}) {
+  const candidateJoin = recentOnly ? `INNER JOIN (
+                         SELECT DISTINCT recent_activity.ENCOUNTERID
+                           FROM ${TRANSACTIONS} AS recent_activity
+                          WHERE recent_activity.ENCOUNTERID IS NOT NULL
+                            AND recent_activity.POSTINGDATE >= DATE_SUB(CURRENT_DATE, INTERVAL 90 DAY)
+                            AND recent_activity.POSTINGDATE < DATE_ADD(CURRENT_DATE, INTERVAL 1 DAY)
+                       ) AS candidates
+                       ON candidates.ENCOUNTERID = transactions.ENCOUNTERID` : "";
+  return `SELECT claim_totals.*,
+                 DATE_ADD(
+                   CASE
+                     WHEN claim_totals.latestResetDate IS NOT NULL
+                      AND (claim_totals.serviceDate IS NULL OR claim_totals.latestResetDate >= claim_totals.serviceDate)
+                     THEN claim_totals.latestResetDate
+                     ELSE claim_totals.serviceDate
+                   END,
+                   INTERVAL 90 DAY
+                 ) AS deadlineDate
+            FROM (
+              SELECT service_lines.claimId,
+                     MIN(service_lines.serviceDate) AS serviceDate,
+                     MAX(service_lines.patientName) AS patientName,
+                     MAX(service_lines.payer) AS payer,
+                     SUBSTRING_INDEX(
+                       SUBSTRING_INDEX(
+                         REPLACE(REPLACE(MAX(service_lines.diagnosisCodes), CHAR(59), ','), '|', ','),
+                         ',',
+                         1
+                       ),
+                       ' ',
+                       1
+                     ) AS primaryDiagnosis,
+                     SUM(service_lines.charge) AS chargedAmount,
+                     SUM(service_lines.receipt) AS paidAmount,
+                     SUM(COALESCE(
+                       service_lines.balance,
+                       service_lines.charge - service_lines.receipt - service_lines.adjustment,
+                       0
+                     )) AS outstandingArAmount,
+                     MAX(service_lines.latestResetDate) AS latestResetDate,
+                     ${procedureQuery
+                       ? "MAX(CASE WHEN service_lines.procedureCode = ? THEN service_lines.charge END)"
+                       : "MAX(service_lines.charge)"} AS prioritizedCptChargedAmount
+                FROM (
+                  SELECT CAST(transactions.ENCOUNTERID AS CHAR) AS claimId,
+                         COALESCE(NULLIF(UPPER(TRIM(transactions.PROCEDURECODE)), ''), 'UNCODED') AS procedureCode,
+                         MIN(DATE(transactions.DATEOFSERVICE)) AS serviceDate,
+                         MAX(TRIM(CONCAT_WS(' ', transactions.FIRSTNAME, transactions.LASTNAME))) AS patientName,
+                         MAX(COALESCE(NULLIF(TRIM(transactions.CompanyName1), ''), NULLIF(TRIM(transactions.PayerPlan1), ''))) AS payer,
+                         MAX(NULLIF(TRIM(transactions.DiagnosisCodes), '')) AS diagnosisCodes,
+                         MAX(COALESCE(transactions.Charges, 0)) AS charge,
+                         MAX(COALESCE(transactions.Receipt, 0)) AS receipt,
+                         MAX(COALESCE(transactions.Adjustments, 0)) AS adjustment,
+                         MAX(transactions.Balance) AS balance,
+                         MAX(CASE WHEN ${ICU_RESET_EVENT_SQL} THEN DATE(transactions.POSTINGDATE) END) AS latestResetDate
+                    FROM ${TRANSACTIONS} AS transactions
+                    ${candidateJoin}
+                   WHERE transactions.ENCOUNTERID IS NOT NULL
+                     AND transactions.DATEOFSERVICE <= CURRENT_DATE
+                   GROUP BY transactions.ENCOUNTERID,
+                            COALESCE(NULLIF(UPPER(TRIM(transactions.PROCEDURECODE)), ''), 'UNCODED')
+                ) AS service_lines
+               GROUP BY service_lines.claimId
+            ) AS claim_totals`;
+}
+
+function latestChargeSummaries(rows) {
+  const latestByClaim = new Map();
+  for (const row of rows) {
+    const claimId = normalizeIdentifier(row.claimId);
+    const chargeDate = dateOnly(row.chargeDate);
+    if (!claimId || !chargeDate) continue;
+    let current = latestByClaim.get(claimId);
+    if (!current || chargeDate > current.date) {
+      current = { date: chargeDate, amount: 0, procedures: [] };
+      latestByClaim.set(claimId, current);
+    }
+    if (chargeDate === current.date) {
+      current.amount = Number((current.amount + numberValue(row.charge)).toFixed(2));
+      current.procedures.push({
+        procedure: normalizeIdentifier(row.procedureCode) || "UNCODED",
+        latestCharge: numberValue(row.charge),
+      });
+    }
+  }
+  return latestByClaim;
 }
 
 function derivedRows(rows, columns) {
@@ -364,14 +468,14 @@ function normalizeEraEvents(rows, claimIds, source) {
     const reference = normalizeIdentifier(row.reference);
     const claimId = claimForReference(reference, claimIds);
     const amount = numberValue(row.amount);
-    const status = amount > 0 ? "paid" : amount < 0 ? "reversed" : "action";
+    const status = amount > 0 ? "received" : amount < 0 ? "receipt-reversed" : "action";
     const reason = compactReason(row.reason);
     return {
       claimId,
       date: dateOnly(row.eventDate),
       status,
       label: amount > 0
-        ? "Paid"
+        ? "Payment received"
         : amount < 0
           ? "Payment reversed"
           : reason
@@ -386,10 +490,22 @@ function normalizeEraEvents(rows, claimIds, source) {
   }).filter((event) => event.claimId && event.date);
 }
 
+function responseEraRow(row, sourceType, sourceRank) {
+  return { rowId: row.rowId, sourceType, source: sourceType, sourceRank,
+    claimReference: row.reference, payerClaimControl: row.payerClaimControl,
+    remitId: row.traceNumber, payer: row.payer, eventDate: dateOnly(row.eventDate),
+    serviceDate: null, procedure: normalizeIdentifier(row.procedureCode), modifier: "", units: "",
+    lineNumber: row.rowId, chargeCents: Math.round(numberValue(row.charge) * 100),
+    paidCents: Math.round(numberValue(row.amount) * 100), adjustment: row.reason || "",
+  };
+}
+
 async function responseRowsForClaims(session, claimIds) {
   const claimStatusPredicate = referencePredicate("PatientControlNumber", claimIds);
   const claimStatus = await session.select(
-    `SELECT PatientControlNumber AS reference,
+    `SELECT ClaimStatusId AS rowId, ClaimNumber AS payerClaimControl,
+            CheckEftTraceNumber AS traceNumber, PayerName AS payer,
+            PatientControlNumber AS reference,
             CheckEftDate AS eventDate,
             Payment AS amount,
             AdjudProcedure AS procedureCode,
@@ -403,7 +519,9 @@ async function responseRowsForClaims(session, claimIds) {
 
   const ediPredicate = referencePredicate("patient_control_number", claimIds);
   const edi835 = await session.select(
-    `SELECT patient_control_number AS reference,
+    `SELECT id AS rowId, payer_claim_control AS payerClaimControl,
+            trace_number AS traceNumber, payer_name AS payer,
+            patient_control_number AS reference,
             COALESCE(payment_date, claim_received_date, service_date) AS eventDate,
             paid_amount AS amount,
             service_code AS procedureCode,
@@ -415,7 +533,8 @@ async function responseRowsForClaims(session, claimIds) {
     { label: "high-level.claims.edi-responses" },
   );
 
-  return { claimStatus, edi835 };
+  const advancedMdEra = await readAdvancedMdEra(session, { claimIds });
+  return { claimStatus, edi835, advancedMdEra };
 }
 
 async function respondedClaimIds(
@@ -466,6 +585,16 @@ async function respondedClaimIds(
     });
   }
 
+  const amdRows = await session.select(
+    `SELECT DISTINCT ClaimID AS reference, VisitID AS visitId FROM \`${config.schemas.ehr}\`.vw_ODBC_edi_Era_ReportClaim
+      WHERE LicenseKey = ? AND CAST(ClaimID AS UNSIGNED) IN (${claimIds.map(() => "?").join(", ")})`,
+    [config.ehr.licenseKey, ...claimIds], { label: "high-level.no-response.advancedmd" },
+  );
+  for (const row of amdRows) {
+    const claimId = claimForReference(row.reference, claimIds);
+    if (claimId && (!Number(row.visitId) || String(row.visitId) === claimId)) responded.add(claimId);
+  }
+
   onProgress("responses:complete", {
     matchedClaimCount: responded.size,
     processedCount: claimIds.length,
@@ -494,17 +623,185 @@ function deduplicateEvents(events) {
   });
 }
 
-export async function readHighLevelClaims(session, { start, end, limit, sort = "youngest" }) {
+export async function readClaimIcu(session, {
+  limit,
+  offset = 0,
+  sort = "deadline",
+  includePastDeadline = false,
+  procedureQuery = "",
+}) {
+  const summarySql = icuClaimSummarySql({
+    recentOnly: !includePastDeadline,
+    procedureQuery,
+  });
+  const deadlineFilter = includePastDeadline ? "" : "AND claim_icu.deadlineDate >= CURRENT_DATE";
+  const procedureFilter = procedureQuery
+    ? "AND claim_icu.prioritizedCptChargedAmount IS NOT NULL"
+    : "";
+  const orderBy = ICU_SORT_SQL[sort] || ICU_SORT_SQL.deadline;
+  const pageOffset = Number.isSafeInteger(offset) && offset >= 0 ? offset : 0;
+  const claimRows = await session.select(
+      `SELECT COUNT(*) OVER() AS total,
+              claim_icu.claimId,
+              claim_icu.serviceDate,
+              claim_icu.patientName,
+              claim_icu.payer,
+              claim_icu.primaryDiagnosis,
+              claim_icu.chargedAmount,
+              claim_icu.paidAmount,
+              claim_icu.outstandingArAmount,
+              claim_icu.prioritizedCptChargedAmount,
+              claim_icu.latestResetDate,
+              claim_icu.deadlineDate
+         FROM (${summarySql}) AS claim_icu
+        WHERE claim_icu.outstandingArAmount > 0
+          ${deadlineFilter}
+          ${procedureFilter}
+        ORDER BY ${orderBy}
+        LIMIT ${limit}
+       OFFSET ${pageOffset}`,
+      procedureQuery ? [procedureQuery] : [],
+      { label: "high-level.claim-icu.claims" },
+    );
+
+  const claimIds = compact(claimRows.map((row) => normalizeIdentifier(row.claimId)));
+  let cptRows = [];
+  let postedPaymentRows = [];
+  if (claimIds.length) {
+    const placeholders = claimIds.map(() => "?").join(", ");
+    cptRows = await session.select(
+      `SELECT current_lines.claimId,
+              current_lines.procedureCode,
+              SUM(current_lines.charged) AS charged,
+              SUM(current_lines.units) AS units,
+              SUM(COALESCE(
+                current_lines.balance,
+                current_lines.charged - current_lines.receipt - current_lines.adjustment,
+                0
+              )) AS outstandingArAmount
+         FROM (
+           SELECT ranked_lines.claimId,
+                  ranked_lines.procedureCode,
+                  ranked_lines.charged,
+                  ranked_lines.units,
+                  ranked_lines.receipt,
+                  ranked_lines.adjustment,
+                  ranked_lines.balance
+             FROM (
+               SELECT CAST(transactions.ENCOUNTERID AS CHAR) AS claimId,
+                      COALESCE(NULLIF(UPPER(TRIM(transactions.PROCEDURECODE)), ''), 'UNCODED') AS procedureCode,
+                      COALESCE(transactions.Charges, 0) AS charged,
+                      CASE WHEN transactions.UNIT > 0 THEN transactions.UNIT ELSE 1 END AS units,
+                      COALESCE(transactions.Receipt, 0) AS receipt,
+                      COALESCE(transactions.Adjustments, 0) AS adjustment,
+                      transactions.Balance AS balance,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY transactions.ENCOUNTERID,
+                                     DATE(transactions.DATEOFSERVICE),
+                                     COALESCE(NULLIF(TRIM(transactions.PROCEDURECODE), ''), 'UNCODED'),
+                                     COALESCE(transactions.MOD1, ''),
+                                     COALESCE(transactions.MOD2, ''),
+                                     COALESCE(transactions.MOD3, ''),
+                                     COALESCE(transactions.MOD4, ''),
+                                     COALESCE(transactions.UNIT, 1),
+                                     COALESCE(transactions.Charges, 0)
+                        ORDER BY COALESCE(transactions.POSTINGDATE, transactions.DATEOFSERVICE) DESC,
+                                 transactions.CLAIMTRANSACTIONID DESC
+                      ) AS lineRecency
+                 FROM ${TRANSACTIONS} AS transactions
+                WHERE transactions.ENCOUNTERID IN (${placeholders})
+             ) AS ranked_lines
+            WHERE ranked_lines.lineRecency = 1
+         ) AS current_lines
+        GROUP BY current_lines.claimId, current_lines.procedureCode
+        ORDER BY current_lines.claimId, charged DESC, current_lines.procedureCode ASC`,
+      claimIds,
+      { label: "high-level.claim-icu.cpt-lines" },
+    );
+    postedPaymentRows = await readPostedPayments(session, { claimIds });
+  }
+
+  const cptsByClaim = new Map();
+  for (const row of cptRows) {
+    const claimId = normalizeIdentifier(row.claimId);
+    if (!cptsByClaim.has(claimId)) cptsByClaim.set(claimId, []);
+    cptsByClaim.get(claimId).push({
+      procedure: normalizeIdentifier(row.procedureCode) || "UNCODED",
+      charged: numberValue(row.charged),
+      units: Math.max(1, numberValue(row.units)),
+      outstandingArAmount: numberValue(row.outstandingArAmount),
+    });
+  }
+  const paidByClaim = new Map();
+  const paidByClaimCpt = new Map();
+  for (const row of postedPaymentRows) {
+    const claimId = normalizeIdentifier(row.reference);
+    if (!claimId) continue;
+    const procedure = normalizeIdentifier(row.procedureCode) || "UNCODED";
+    const claimCptKey = `${claimId}\u0000${procedure}`;
+    paidByClaim.set(claimId, Number(
+      ((paidByClaim.get(claimId) || 0) + numberValue(row.paid)).toFixed(2),
+    ));
+    paidByClaimCpt.set(claimCptKey, Number(
+      ((paidByClaimCpt.get(claimCptKey) || 0) + numberValue(row.paid)).toFixed(2),
+    ));
+  }
+
+  return {
+    total: numberValue(claimRows[0]?.total),
+    claims: claimRows.map((row) => {
+      const claimId = normalizeIdentifier(row.claimId);
+      return {
+        claimId,
+        patientName: text(row.patientName) || null,
+        payer: text(row.payer) || null,
+        serviceDate: dateOnly(row.serviceDate),
+        primaryDiagnosis: text(row.primaryDiagnosis).toUpperCase() || null,
+        chargedAmount: numberValue(row.chargedAmount),
+        paidAmount: paidByClaim.get(claimId) || 0,
+        outstandingArAmount: numberValue(row.outstandingArAmount),
+        latestResetDate: dateOnly(row.latestResetDate),
+        deadlineDate: dateOnly(row.deadlineDate),
+        prioritizedCptChargedAmount: numberValue(row.prioritizedCptChargedAmount),
+        cptFinancials: (cptsByClaim.get(claimId) || []).map((line) => ({
+          ...line,
+          postedAmount: paidByClaimCpt.get(`${claimId}\u0000${line.procedure}`) || 0,
+        })),
+      };
+    }),
+  };
+}
+
+export async function readHighLevelClaims(session, {
+  start,
+  end,
+  limit,
+  offset = 0,
+  sort = "youngest",
+  procedureQuery = "",
+}) {
   const activityWhere = `(POSTINGDATE BETWEEN ? AND ? OR DATEOFSERVICE BETWEEN ? AND ?)`;
   const rangeParameters = [start, end, start, end];
+  // Match claim families before pagination without trimming their other CPT
+  // lines, financial totals, invoice matching, or full-history payment timing.
+  const procedureWhere = procedureQuery ? `AND EXISTS (
+            SELECT 1 FROM ${TRANSACTIONS} AS procedure_matches
+             WHERE procedure_matches.ENCOUNTERID = claim_activity.ENCOUNTERID
+               AND UPPER(TRIM(procedure_matches.PROCEDURECODE)) LIKE ?
+          )` : "";
+  const filterParameters = procedureQuery
+    ? [...rangeParameters, `%${procedureQuery}%`]
+    : rangeParameters;
   const orderBy = CLAIM_SORT_SQL[sort] || CLAIM_SORT_SQL.youngest;
+  const pageOffset = Number.isSafeInteger(offset) && offset >= 0 ? offset : 0;
   const [countRows, claims] = await Promise.all([
     session.select(
       `SELECT COUNT(DISTINCT CAST(ENCOUNTERID AS CHAR)) AS total
-         FROM ${TRANSACTIONS}
+         FROM ${TRANSACTIONS} AS claim_activity
         WHERE ENCOUNTERID IS NOT NULL
-          AND ${activityWhere}`,
-      rangeParameters,
+          AND ${activityWhere}
+          ${procedureWhere}`,
+      filterParameters,
       { label: "high-level.claims.count" },
     ),
     session.select(
@@ -534,15 +831,17 @@ export async function readHighLevelClaims(session, { start, end, limit, sort = "
                   MAX(COALESCE(NULLIF(PayerPlan1, ''), NULLIF(CompanyName1, ''))) AS payer,
                   MAX(COALESCE(Charges, 0)) AS procedureCharge,
                   MAX(COALESCE(Receipt, 0)) AS procedurePaid
-             FROM ${TRANSACTIONS}
+             FROM ${TRANSACTIONS} AS claim_activity
             WHERE ENCOUNTERID IS NOT NULL
               AND ${activityWhere}
+              ${procedureWhere}
             GROUP BY ENCOUNTERID, PROCEDURECODE
          ) AS service_lines
         GROUP BY service_lines.claimId
         ORDER BY ${orderBy}
-        LIMIT ${limit}`,
-      rangeParameters,
+        LIMIT ${limit}
+       OFFSET ${pageOffset}`,
+      filterParameters,
       { label: "high-level.claims.summary" },
     ),
   ]);
@@ -560,21 +859,57 @@ export async function readHighLevelClaims(session, { start, end, limit, sort = "
             SUM(COALESCE(Charges, 0)) AS charge
        FROM ${TRANSACTIONS}
       WHERE ENCOUNTERID IN (${placeholders})
-        AND ${activityWhere}
       GROUP BY ENCOUNTERID, eventDate, CLAIMTRANSACTIONTYPENAME, PROCEDURECODE
       ORDER BY eventDate ASC`,
-    [...claimIds, ...rangeParameters],
+    claimIds,
     { label: "high-level.claims.transaction-events" },
   );
-  const [responseRows, invoiceMatches] = await Promise.all([
+  const [latestChargeRows, responseRows, invoiceMatches, postedRows] = await Promise.all([
+    session.select(
+      `SELECT CAST(charge_rows.ENCOUNTERID AS CHAR) AS claimId,
+              DATE(COALESCE(charge_rows.POSTINGDATE, charge_rows.DATEOFSERVICE)) AS chargeDate,
+              COALESCE(NULLIF(TRIM(charge_rows.PROCEDURECODE), ''), 'UNCODED') AS procedureCode,
+              MAX(COALESCE(charge_rows.Charges, 0)) AS charge
+         FROM ${TRANSACTIONS} AS charge_rows
+        WHERE charge_rows.ENCOUNTERID IN (${placeholders})
+          AND charge_rows.Charges IS NOT NULL
+          AND charge_rows.CLAIMTRANSACTIONTYPENAME IN (
+            'Claim created', 'Created claim', 'Billed', 'Re-billed claim', 'Re-billed'
+          )
+        GROUP BY charge_rows.ENCOUNTERID,
+                 chargeDate,
+                 COALESCE(NULLIF(TRIM(charge_rows.PROCEDURECODE), ''), 'UNCODED')
+        ORDER BY claimId ASC, chargeDate DESC, procedureCode ASC`,
+      claimIds,
+      { label: "high-level.claims.latest-charges" },
+    ),
     responseRowsForClaims(session, claimIds),
     invoiceMatchesForClaims(session, claims),
+    readPostedPayments(session, { claimIds }),
   ]);
-  const events = deduplicateEvents([
-    ...normalizeTransactionEvents(transactionRows),
-    ...normalizeEraEvents(responseRows.claimStatus, claimIds, "payer"),
-    ...normalizeEraEvents(responseRows.edi835, claimIds, "payer"),
-  ]).filter((event) => event.date >= start && event.date <= end);
+  const latestCharges = latestChargeSummaries(latestChargeRows);
+  const normalizedEras = distinctEraRows([
+    ...advancedMdEraRows(responseRows.advancedMdEra),
+    ...responseRows.claimStatus.map((row) => responseEraRow(row, "claimStatus", 1)),
+    ...responseRows.edi835.map((row) => responseEraRow(row, "edi835", 2)),
+  ]).rows;
+  const receivedEvents = normalizeEraEvents(normalizedEras.map((row) => ({
+    reference: row.claimReference, eventDate: row.eventDate,
+    amount: row.paidCents / 100, procedureCode: row.procedure,
+    charge: row.chargeCents == null ? null : row.chargeCents / 100, reason: row.adjustment,
+  })), claimIds, "payer");
+  const postedEvents = postedRows.map((row) => ({
+    claimId: normalizeIdentifier(row.reference), date: dateOnly(row.eventDate),
+    status: numberValue(row.paid) < 0 ? "reversed" : "paid",
+    label: numberValue(row.paid) < 0 ? "Posted payment reversed" : "Posted payment",
+    amount: numberValue(row.paid), procedure: normalizeIdentifier(row.procedureCode),
+    source: "billing", id: `${row.sourceSystem}:${row.eventType}:${row.transactionId}:${row.paymentId}:${row.chargeId}`,
+  })).filter((event) => event.date);
+  const lifecycleEvents = [
+    ...deduplicateEvents(normalizeTransactionEvents(transactionRows).filter((event) => !["paid", "reversed"].includes(event.status))),
+    ...postedEvents, ...receivedEvents,
+  ];
+  const events = lifecycleEvents.filter((event) => event.date >= start && event.date <= end);
 
   return {
     total: numberValue(countRows[0]?.total),
@@ -589,6 +924,9 @@ export async function readHighLevelClaims(session, { start, end, limit, sort = "
         firstActivity: dateOnly(claim.firstActivity),
         lastActivity: dateOnly(claim.lastActivity),
         billedAmount: numberValue(claim.billedAmount),
+        latestChargeAmount: latestCharges.get(claimId)?.amount || 0,
+        latestChargeDate: latestCharges.get(claimId)?.date || null,
+        latestChargeByCpt: latestCharges.get(claimId)?.procedures || [],
         paidAmount: numberValue(claim.paidAmount),
         paidPercent: numberValue(claim.paidPercent),
         invoiceRowCount: invoiceMatch.rowCount || 0,
@@ -598,6 +936,7 @@ export async function readHighLevelClaims(session, { start, end, limit, sort = "
       };
     }),
     events,
+    lifecycleEvents,
   };
 }
 
@@ -813,7 +1152,7 @@ export async function readHighLevelDashboard(session, { start, end }) {
   );
 
   const claimStatusRows = await session.select(
-    `SELECT PatientControlNumber AS reference,
+    `SELECT ClaimStatusId AS rowId, ClaimNumber AS payerClaimControl, PatientControlNumber AS reference,
             DATE(COALESCE(CheckEftDate, EobTransactionDate, ImportedAtUtc, DateOfServiceStart)) AS eventDate,
             DateOfServiceStart AS serviceDate,
             COALESCE(NULLIF(AdjudProcedure, ''), NULLIF(SubProcedure, '')) AS procedureCode,
@@ -836,7 +1175,7 @@ export async function readHighLevelDashboard(session, { start, end }) {
   const compactStart = start.replaceAll("-", "");
   const compactEnd = end.replaceAll("-", "");
   const ediRows = await session.select(
-    `SELECT patient_control_number AS reference,
+    `SELECT id AS rowId, payer_claim_control AS payerClaimControl, patient_control_number AS reference,
             COALESCE(payment_date, claim_received_date, service_date, statement_from_date) AS eventDate,
             COALESCE(service_date, statement_from_date) AS serviceDate,
             service_code AS procedureCode,
@@ -860,7 +1199,10 @@ export async function readHighLevelDashboard(session, { start, end }) {
     { label: "high-level.dashboard.edi-835" },
   );
 
-  const deniedEncounterIds = deniedEncounterCandidates([...claimStatusRows, ...ediRows]);
+  const [advancedMdEra, postedRows] = await Promise.all([
+    readAdvancedMdEra(session, { start, end }), readPostedPayments(session, { start, end }),
+  ]);
+  const deniedEncounterIds = deniedEncounterCandidates([...claimStatusRows, ...ediRows, ...advancedMdEra]);
   const latestDeniedBilledRows = deniedEncounterIds.length ? await session.select(
     `SELECT latest_lines.claimId,
             latest_lines.procedureCode,
@@ -889,5 +1231,5 @@ export async function readHighLevelDashboard(session, { start, end }) {
     { label: "high-level.dashboard.latest-denied-billed" },
   ) : [];
 
-  return { billedRows, originalRows, claimStatusRows, ediRows, latestDeniedBilledRows };
+  return { billedRows, originalRows, claimStatusRows, ediRows, advancedMdEra, postedRows, latestDeniedBilledRows };
 }

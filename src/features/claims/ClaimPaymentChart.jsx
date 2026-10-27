@@ -1,3 +1,4 @@
+import { paymentViewData } from "./paymentChartModel.js";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { StatusBadge } from "../../components/StatusBadge.jsx";
 import {
@@ -8,7 +9,7 @@ import {
   buildStepPath,
   selectNonOverlappingDateTicks,
 } from "./paymentChartModel.js";
-import { buildClaimStory, plainSourceLabel } from "./claimStoryModel.js";
+import { buildClaimStory, plainSourceLabel, scopeClaimDataToProcedure } from "./claimStoryModel.js";
 import { formatDate, formatMoney } from "./ClaimSummary.jsx";
 
 function categoryClass(category) {
@@ -53,7 +54,7 @@ function CptMiniGraph({ model, activeIndex, activeDate, eventCount, onHover, onE
   const [tooltip, setTooltip] = useState(null);
   const width = 360;
   const height = 150;
-  const plot = { left: 10, right: width - 10, top: 10, bottom: height - 18 };
+  const plot = { left: 10, right: width - 10, top: 10, bottom: height - 24 };
   const values = model.points.map((point) => point.cumulative);
   const minimum = Math.min(0, ...values);
   const maximum = Math.max(0, model.charge, ...values);
@@ -119,7 +120,7 @@ function CptMiniGraph({ model, activeIndex, activeDate, eventCount, onHover, onE
           <strong>{model.procedure}</strong>
         </div>
         <div>
-          <strong className={amountTone}>{formatMoney(currentPoint.cumulative)} paid</strong>
+          <strong className={amountTone}>{formatMoney(currentPoint.cumulative)} {model.paymentView === "received" ? "received" : "posted"}</strong>
           <small>of {formatMoney(model.charge)} charged</small>
         </div>
       </header>
@@ -127,7 +128,7 @@ function CptMiniGraph({ model, activeIndex, activeDate, eventCount, onHover, onE
         className="cpt-mini-chart"
         viewBox={`0 0 ${width} ${height}`}
         role="img"
-        aria-label={`${chartName}: ${formatMoney(currentPoint.cumulative)} paid through ${formatDate(activeDate)}, against ${formatMoney(model.charge)} charged.`}
+        aria-label={`${chartName}: ${formatMoney(currentPoint.cumulative)} ${model.paymentView === "received" ? "received" : "posted"} through ${formatDate(activeDate)}, against ${formatMoney(model.charge)} charged.`}
       >
         <line className="cpt-mini-zero" x1={plot.left} x2={plot.right} y1={yScale(0)} y2={yScale(0)} />
         <line className="cpt-mini-charge" x1={plot.left} x2={plot.right} y1={yScale(model.charge)} y2={yScale(model.charge)} />
@@ -160,8 +161,8 @@ function CptMiniGraph({ model, activeIndex, activeDate, eventCount, onHover, onE
             </g>
           );
         }))}
-        <text className="cpt-mini-date" x={plot.left} y={height - 3}>{formatDate(model.points[0]?.date)}</text>
-        <text className="cpt-mini-date" x={plot.right} y={height - 3} textAnchor="end">{formatDate(model.points.at(-1)?.date)}</text>
+        <text className="cpt-mini-date" x={plot.left} y={height - 6}>{formatDate(model.points[0]?.date)}</text>
+        <text className="cpt-mini-date" x={plot.right} y={height - 6} textAnchor="end">{formatDate(model.points.at(-1)?.date)}</text>
       </svg>
       {tooltipPoint ? (
         <span
@@ -172,9 +173,9 @@ function CptMiniGraph({ model, activeIndex, activeDate, eventCount, onHover, onE
           <strong>{formatDate(tooltipPoint.date)}</strong>
           <span>{pointDescription(tooltipPoint)}</span>
           {Math.abs(tooltipPoint.delta) >= 0.005 ? (
-            <em>{tooltipPoint.delta < 0 ? "Recouped" : "Received"} {formatMoney(Math.abs(tooltipPoint.delta))}</em>
+            <em>{tooltipPoint.delta < 0 ? "Reversed" : model.paymentView === "received" ? "Received" : "Posted"} {formatMoney(Math.abs(tooltipPoint.delta))}</em>
           ) : null}
-          <small>{formatMoney(tooltipPoint.cumulative)} paid to date</small>
+          <small>{formatMoney(tooltipPoint.cumulative)} {model.paymentView === "received" ? "received" : "posted"} to date</small>
         </span>
       ) : null}
       <span className="cpt-mini-expand-hint">Click to expand</span>
@@ -236,7 +237,7 @@ function CptExpandedPanel({ model, activeIndex, onHover, onMinimize }) {
         <dl>
           <div><dt>Charged</dt><dd>{formatMoney(model.charge)}</dd></div>
           <div><dt>Paid through {formatDate(activePoint?.date)}</dt><dd className={(activePoint?.cumulative || 0) < 0 ? "amount-negative" : "amount-positive"}>{formatMoney(activePoint?.cumulative)}</dd></div>
-          <div><dt>Current balance</dt><dd>{formatMoney(model.charge - model.totalPaid)}</dd></div>
+          <div><dt>Charge less selected payments</dt><dd>{formatMoney(model.charge - model.totalPaid)}</dd></div>
         </dl>
         <button type="button" onClick={onMinimize} aria-label={`Minimize ${chartName} detail`}>
           <span aria-hidden="true">−</span> Minimize
@@ -246,7 +247,7 @@ function CptExpandedPanel({ model, activeIndex, onHover, onMinimize }) {
       <div className="cpt-detail-content">
         <div className="cpt-detail-chart-wrap">
           <div className="cpt-detail-legend">
-            <span><i className="legend-line legend-payment" />Paid</span>
+            <span><i className="legend-line legend-payment" />Payment amount</span>
             <span><i className="legend-line legend-charges" />Charged</span>
             <span><i className="cpt-event-key cpt-event-key-rebill" />Rebill</span>
             <span><i className="cpt-event-key cpt-event-key-payment" />Payment</span>
@@ -256,7 +257,7 @@ function CptExpandedPanel({ model, activeIndex, onHover, onMinimize }) {
             className="cpt-detail-chart"
             viewBox={`0 0 ${width} ${height}`}
             role="img"
-            aria-label={`Interactive ${chartName} payment history. ${formatMoney(model.totalPaid)} currently paid against ${formatMoney(model.charge)} charged.`}
+            aria-label={`Interactive ${chartName} payment history. ${formatMoney(model.totalPaid)} ${model.paymentView === "received" ? "received" : "posted"} against ${formatMoney(model.charge)} charged.`}
             onMouseMove={handlePointerMove}
             onMouseLeave={() => onHover(null)}
           >
@@ -286,7 +287,7 @@ function CptExpandedPanel({ model, activeIndex, onHover, onMinimize }) {
                   key={`${point.date}-${marker.kind}`}
                   role="button"
                   tabIndex="0"
-                  aria-label={`${formatDate(point.date)}: ${marker.label}. ${formatMoney(point.cumulative)} paid to date.`}
+                  aria-label={`${formatDate(point.date)}: ${marker.label}. ${formatMoney(point.cumulative)} ${model.paymentView === "received" ? "received" : "posted"} to date.`}
                   onFocus={() => onHover(point.index)}
                   onBlur={() => onHover(null)}
                   onClick={() => onHover(point.index)}
@@ -308,9 +309,9 @@ function CptExpandedPanel({ model, activeIndex, onHover, onMinimize }) {
             <ol>
               {activity.map((point) => (
                 <li className={point.index === activeIndex ? "cpt-detail-activity-active" : ""} key={`${point.date}-${point.index}`} onMouseEnter={() => onHover(point.index)} onMouseLeave={() => onHover(null)}>
-                  <div><strong>{formatDate(point.date)}</strong><span>{point.delta < 0 ? "Recouped" : "Received"}</span></div>
+                  <div><strong>{formatDate(point.date)}</strong><span>{point.delta < 0 ? "Reversed" : model.paymentView === "received" ? "Received" : "Posted"}</span></div>
                   <b className={point.delta < 0 ? "amount-negative" : "amount-positive"}>{formatMoney(point.delta)}</b>
-                  <small>{formatMoney(point.cumulative)} paid to date</small>
+                  <small>{formatMoney(point.cumulative)} {model.paymentView === "received" ? "received" : "posted"} to date</small>
                 </li>
               ))}
             </ol>
@@ -321,11 +322,31 @@ function CptExpandedPanel({ model, activeIndex, onHover, onMinimize }) {
   );
 }
 
-function CptPaymentShelf({ models, activeIndex, activeDate, eventCount, onHover }) {
+function CptPaymentShelf({
+  models,
+  activeIndex,
+  activeDate,
+  eventCount,
+  selectedProcedure = null,
+  onHover,
+  onSelectedProcedureChange,
+}) {
   const [expandedProcedure, setExpandedProcedure] = useState(null);
-  const aggregateModel = useMemo(() => buildAggregateCptPaymentModel(models), [models]);
+  const aggregateModel = useMemo(() => { const aggregate = buildAggregateCptPaymentModel(models);
+    return aggregate ? { ...aggregate, paymentView: models[0]?.paymentView } : null; }, [models]);
   const chartModels = aggregateModel ? [aggregateModel, ...models] : models;
   const expandedModel = chartModels.find((model) => model.procedure === expandedProcedure) || null;
+
+  useEffect(() => {
+    if (selectedProcedure || expandedProcedure === "All CPTs") return;
+    setExpandedProcedure(null);
+  }, [expandedProcedure, selectedProcedure]);
+
+  useEffect(() => {
+    if (!expandedProcedure || expandedModel) return;
+    setExpandedProcedure(null);
+    onSelectedProcedureChange?.(null);
+  }, [expandedModel, expandedProcedure, onSelectedProcedureChange]);
 
   useEffect(() => {
     if (!expandedModel) return undefined;
@@ -339,11 +360,11 @@ function CptPaymentShelf({ models, activeIndex, activeDate, eventCount, onHover 
   return (
     <section className={`cpt-mini-shelf${expandedModel ? " cpt-mini-shelf-expanded" : ""}`} aria-labelledby="cpt-payment-heading">
       <header className="cpt-mini-shelf-heading">
-        <div><strong id="cpt-payment-heading">CPT payment charts</strong><span>Three per row · aggregate first · then highest charge</span></div>
+        <div><strong id="cpt-payment-heading">CPT {models[0]?.paymentView === "received" ? "received" : "posted"} payment charts</strong><span>Three per row · aggregate first · then highest charge</span></div>
         <span>Hover for dated amounts · click to expand · through {formatDate(activeDate)}</span>
       </header>
       <div className="cpt-mini-legend" aria-label="CPT graph legend">
-        <span><i className="legend-line legend-payment" />Paid</span>
+        <span><i className="legend-line legend-payment" />Payment amount</span>
         <span><i className="legend-line legend-charges" />Charged</span>
         <span><i className="cpt-event-key cpt-event-key-rebill" />Rebill</span>
         <span><i className="cpt-event-key cpt-event-key-payment" />Payment</span>
@@ -354,7 +375,10 @@ function CptPaymentShelf({ models, activeIndex, activeDate, eventCount, onHover 
           model={expandedModel}
           activeIndex={activeIndex}
           onHover={onHover}
-          onMinimize={() => setExpandedProcedure(null)}
+          onMinimize={() => {
+            setExpandedProcedure(null);
+            onSelectedProcedureChange?.(null);
+          }}
         />
       ) : null}
       {models.length ? (
@@ -368,13 +392,16 @@ function CptPaymentShelf({ models, activeIndex, activeDate, eventCount, onHover 
                 activeDate={activeDate}
                 eventCount={eventCount}
                 onHover={onHover}
-                onExpand={setExpandedProcedure}
+                onExpand={(procedure) => {
+                  setExpandedProcedure(procedure);
+                  onSelectedProcedureChange?.(procedure === "All CPTs" ? null : procedure);
+                }}
               />
             ))}
           </div>
         </div>
       ) : (
-        <p className="cpt-mini-empty">No CPT-level ERA payments are available for this claim.</p>
+        <p className="cpt-mini-empty">No CPT-level payments are available for this claim.</p>
       )}
       <div className="cpt-grid-footer">
         <b>{models.length} CPT{models.length === 1 ? "" : "s"}{aggregateModel ? " · 1 aggregate" : ""}</b>
@@ -406,16 +433,26 @@ function storyStatusLabel(status) {
   return "Claim activity";
 }
 
-function LinkedTimeline({ data, activeDate, autoExpandKey }) {
-  const episodes = useMemo(() => buildClaimStory(data), [data]);
+function LinkedTimeline({ data, activeDate, autoExpandKey, selectedProcedure = null }) {
+  const scopedData = useMemo(
+    () => selectedProcedure ? scopeClaimDataToProcedure(data, selectedProcedure) : data,
+    [data, selectedProcedure],
+  );
+  const episodes = useMemo(
+    () => buildClaimStory(scopedData, { selectedProcedure }),
+    [scopedData, selectedProcedure],
+  );
   const [expandedKey, setExpandedKey] = useState(null);
   const scrollRef = useRef(null);
   const groupRefs = useRef(new Map());
-  const activeEpisode = episodes.find((episode) => episode.dates.includes(activeDate)) || null;
+  const activeEpisode = episodes.find((episode) => episode.dates.includes(activeDate)) || episodes.at(-1) || null;
   const activeEpisodeKey = activeEpisode?.key || null;
   const activeEpisodeNumber = Math.max(1, episodes.findIndex((episode) => episode.key === activeEpisodeKey) + 1);
+  const followedDate = episodes.some((episode) => episode.dates.includes(activeDate))
+    ? activeDate
+    : activeEpisode?.endDate;
 
-  useEffect(() => setExpandedKey(null), [data.claim.claimId]);
+  useEffect(() => setExpandedKey(null), [data.claim.claimId, selectedProcedure]);
 
   useEffect(() => {
     if (autoExpandKey == null || !activeEpisodeKey) return;
@@ -445,21 +482,39 @@ function LinkedTimeline({ data, activeDate, autoExpandKey }) {
     <aside className="linked-timeline-panel" aria-labelledby="linked-timeline-heading">
       <header className="linked-timeline-header">
         <div className="linked-timeline-title">
-          <span className="linked-timeline-title-icon" aria-hidden="true">↳</span>
-          <div>
-            <p className="section-kicker">Plain-language journey</p>
-            <h3 id="linked-timeline-heading">Claim story</h3>
-            <small>{episodes.length} clear steps from {data.timeline.length} source records</small>
+            <span className="linked-timeline-title-icon" aria-hidden="true">↳</span>
+            <div>
+            <p className="section-kicker">{selectedProcedure ? "CPT-specific journey" : "Plain-language journey"}</p>
+            <h3 id="linked-timeline-heading">{selectedProcedure ? `${selectedProcedure} story` : "Claim story"}</h3>
+            <small>{selectedProcedure
+              ? `${episodes.length} clear steps from ${scopedData.procedureScope.relevantRecordCount} CPT records`
+              : `${episodes.length} clear steps from ${data.timeline.length} source records`}</small>
           </div>
         </div>
         <div className="linked-timeline-following" aria-live="polite">
-          <span><i aria-hidden="true" />Step {activeEpisodeNumber} of {episodes.length}</span>
-          <strong>{formatDate(activeDate)}</strong>
+          <span><i aria-hidden="true" />{episodes.length ? `Step ${activeEpisodeNumber} of ${episodes.length}` : "No linked steps"}</span>
+          <strong>{formatDate(followedDate)}</strong>
         </div>
       </header>
 
       <div className="linked-timeline-scroll" ref={scrollRef}>
-        <p className="linked-timeline-guide">Select a step to see the original records behind it.</p>
+        {selectedProcedure ? (
+          <dl className="linked-timeline-cpt-summary" aria-label={`${selectedProcedure} financial summary`}>
+            <div><dt>CPT / HCPCS</dt><dd>{selectedProcedure}</dd></div>
+            <div><dt>Charged</dt><dd>{formatMoney(scopedData.procedureScope.charged)}</dd></div>
+            <div><dt>Payer received</dt><dd>{formatMoney(scopedData.procedureScope.received)}</dd></div>
+            <div><dt>Posted internally</dt><dd>{formatMoney(scopedData.procedureScope.posted)}</dd></div>
+          </dl>
+        ) : null}
+        <p className="linked-timeline-guide">{selectedProcedure
+          ? `Only ${selectedProcedure} activity is shown. Claim-level service date is retained as context.`
+          : "Select a step to see the original records behind it."}</p>
+        {!episodes.length ? (
+          <div className="linked-timeline-empty">
+            <strong>No source records are explicitly linked to {selectedProcedure}</strong>
+            <p>The CPT graph can still reflect claim data, but this claim’s source history does not identify that code on individual events.</p>
+          </div>
+        ) : null}
         {episodes.map((episode, episodeIndex) => {
           const active = episode.key === activeEpisodeKey;
           const expanded = episode.key === expandedKey;
@@ -515,7 +570,7 @@ function LinkedTimeline({ data, activeDate, autoExpandKey }) {
                       >
                         <div className="linked-timeline-event-meta">
                           <time dateTime={event.date || undefined}>{formatDate(event.date)}</time>
-                          <StatusBadge tone="neutral">{plainSourceLabel(event.source)}</StatusBadge>
+                          <StatusBadge tone="neutral">{event.claimContext ? "Claim context" : plainSourceLabel(event.source)}</StatusBadge>
                         </div>
                         <div className="linked-timeline-event-heading">
                           <h4>{supportingTitle(event)}</h4>
@@ -543,13 +598,13 @@ function LinkedTimeline({ data, activeDate, autoExpandKey }) {
 function LegacyClaimPaymentChart({ data, onCptPaymentSnapshotChange }) {
   const model = useMemo(() => buildPaymentChartModel(data), [data]);
   const { eventGroups, paymentPoints, charges } = model;
-  const cptModels = useMemo(() => buildCptPaymentModels(data, eventGroups), [data, eventGroups]);
+  const cptModels = useMemo(() => buildCptPaymentModels(chartData, eventGroups).map((item) => ({ ...item, paymentView })), [chartData, eventGroups, paymentView]);
   const eventGroupKey = eventGroups.map((group) => group.date).join("|");
   const [hoveredIndex, setHoveredIndex] = useState(null);
   const [selectedIndex, setSelectedIndex] = useState(Math.max(0, eventGroups.length - 1));
   const cptPaymentSnapshot = useMemo(
-    () => buildCptPaidSnapshot(cptModels, eventGroups, hoveredIndex),
-    [cptModels, eventGroups, hoveredIndex],
+    () => ({ ...buildCptPaidSnapshot(cptModels, eventGroups, hoveredIndex), paymentView }),
+    [cptModels, eventGroups, hoveredIndex, paymentView],
   );
 
   useEffect(() => {
@@ -676,7 +731,7 @@ function LegacyClaimPaymentChart({ data, onCptPaymentSnapshotChange }) {
         <div className="chart-stage">
           <div className="main-chart-pane">
             <div className="chart-inline-legend" aria-hidden="true">
-              <span><i className="legend-line legend-payment" />Paid</span>
+              <span><i className="legend-line legend-payment" />Payment amount</span>
               <span><i className="legend-line legend-charges" />Charges</span>
             </div>
             <svg
@@ -803,18 +858,32 @@ function LegacyClaimPaymentChart({ data, onCptPaymentSnapshotChange }) {
   );
 }
 
-export function ClaimPaymentChart({ data, onCptPaymentSnapshotChange }) {
-  const model = useMemo(() => buildPaymentChartModel(data), [data]);
+export function ClaimPaymentChart({
+  data,
+  selectedProcedure = null,
+  onSelectedProcedureChange,
+  onCptPaymentSnapshotChange,
+}) {
+  const [paymentView, setPaymentView] = useState("posted");
+  const chartData = useMemo(() => paymentViewData(data, paymentView), [data, paymentView]);
+  const model = useMemo(() => buildPaymentChartModel(chartData), [chartData]);
   const { eventGroups } = model;
-  const cptModels = useMemo(() => buildCptPaymentModels(data, eventGroups), [data, eventGroups]);
+  const cptModels = useMemo(() => buildCptPaymentModels(chartData, eventGroups).map((item) => ({ ...item, paymentView })), [chartData, eventGroups, paymentView]);
   const eventGroupKey = eventGroups.map((group) => group.date).join("|");
   const [hoveredIndex, setHoveredIndex] = useState(null);
   const activeIndex = hoveredIndex ?? Math.max(0, eventGroups.length - 1);
   const activeGroup = eventGroups[activeIndex] || eventGroups.at(-1);
-  const cptPaymentSnapshot = useMemo(
-    () => buildCptPaidSnapshot(cptModels, eventGroups, hoveredIndex),
-    [cptModels, eventGroups, hoveredIndex],
-  );
+  const cptPaymentSnapshot = useMemo(() => {
+    const snapshot = buildCptPaidSnapshot(cptModels, eventGroups, hoveredIndex);
+    return {
+      ...snapshot,
+      paymentView,
+      selectedProcedure,
+      items: selectedProcedure
+        ? snapshot.items.filter((item) => item.procedure === selectedProcedure)
+        : snapshot.items,
+    };
+  }, [cptModels, eventGroups, hoveredIndex, paymentView, selectedProcedure]);
 
   useEffect(() => setHoveredIndex(null), [eventGroupKey]);
 
@@ -835,6 +904,11 @@ export function ClaimPaymentChart({ data, onCptPaymentSnapshotChange }) {
 
   return (
     <section className="payment-chart-card payment-chart-card-cpt-grid" aria-labelledby="cpt-payment-heading">
+      <div className="payment-view-switch" role="group" aria-label="Payment chart source">
+        <button type="button" aria-pressed={paymentView === "posted"} onClick={() => setPaymentView("posted")}>Posted payment</button>
+        <button type="button" aria-pressed={paymentView === "received"} onClick={() => setPaymentView("received")}>Payment received</button>
+        <span>{paymentView === "posted" ? "Recorded on the posting date" : "Recorded on the ERA check / EFT date"}</span>
+      </div>
       <div className="payment-chart-layout payment-chart-layout-cpt-grid">
         <div className="chart-stage cpt-grid-stage">
           <CptPaymentShelf
@@ -842,7 +916,9 @@ export function ClaimPaymentChart({ data, onCptPaymentSnapshotChange }) {
             activeIndex={activeIndex}
             activeDate={activeGroup.date}
             eventCount={eventGroups.length}
+            selectedProcedure={selectedProcedure}
             onHover={setHoveredIndex}
+            onSelectedProcedureChange={onSelectedProcedureChange}
           />
         </div>
 
@@ -850,6 +926,7 @@ export function ClaimPaymentChart({ data, onCptPaymentSnapshotChange }) {
           data={data}
           activeDate={activeGroup.date}
           autoExpandKey={hoveredIndex == null ? null : `${eventGroupKey}:${hoveredIndex}`}
+          selectedProcedure={selectedProcedure}
         />
       </div>
     </section>

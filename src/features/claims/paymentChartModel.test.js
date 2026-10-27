@@ -141,6 +141,7 @@ test("categorized Salesforce comments are graphed in timestamp order without cha
 
 test("CPT payment models use highest observed charges and follow main graph dates", () => {
   const data = {
+    paymentView: "received",
     summary: { charges: 1000, totalPaid: 225 },
     timeline: [
       { date: "2026-01-01", title: "Date of service", countedPayment: 0 },
@@ -180,6 +181,7 @@ test("CPT payment models preserve reversals", () => {
     { date: "2026-01-24" },
   ];
   const cpts = buildCptPaymentModels({
+    paymentView: "received",
     eras: [
       { date: "2026-01-20", serviceLines: [{ procedure: "78835", billed: 900, paid: 300 }] },
       { date: "2026-01-24", serviceLines: [{ procedure: "78835", billed: 900, paid: -75 }] },
@@ -225,12 +227,13 @@ test("aggregate CPT model sums every displayed CPT graph", () => {
     [175, 175],
     [0, 175],
   ]);
-  assert.equal(aggregate.points[1].markers[0].label, "Payment received across all CPTs");
+  assert.equal(aggregate.points[1].markers[0].label, "Posted payment across all CPTs");
   assert.deepEqual(aggregate.points[2].markers, []);
 });
 
 test("CPT graphs carry rebill, payment, and denial markers on their dated points", () => {
   const data = {
+    paymentView: "received",
     claim: { procedure: "78802" },
     timeline: [
       { date: "2026-01-01", title: "Claim created", countedPayment: 0 },
@@ -276,6 +279,7 @@ test("CPT sidebar snapshot shows current paid amounts until a graph date is hove
     { date: "2026-02-10" },
   ];
   const cpts = buildCptPaymentModels({
+    paymentView: "received",
     claim: { procedure: "78802, 77300, 77470" },
     eras: [
       { date: "2026-01-20", serviceLines: [{ procedure: "78802", billed: 500, paid: 100 }] },
@@ -301,6 +305,7 @@ test("CPT sidebar snapshot shows current paid amounts until a graph date is hove
 
 test("CPT models include reconciled transaction fallback payments without an ERA", () => {
   const data = {
+    paymentView: "received",
     claim: { procedure: "99205" },
     cptFinancials: [{ procedure: "99205", charged: 507.15 }],
     summary: { charges: 507.15, totalPaid: 131.32 },

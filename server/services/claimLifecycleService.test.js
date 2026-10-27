@@ -4,6 +4,7 @@ import {
   buildClaimLifecycle,
   MYSQL_CLAIM_CACHE_TTL_MS,
 } from "./claimLifecycleService.js";
+import { buildClaimVitals } from "./claimVitalsService.js";
 
 test("claim MySQL lifecycle results remain cached for 24 hours", () => {
   assert.equal(MYSQL_CLAIM_CACHE_TTL_MS, 24 * 60 * 60 * 1_000);
@@ -315,7 +316,7 @@ function edi(overrides = {}) {
   };
 }
 
-test("ERA payments take precedence and a posting is counted only as fallback", () => {
+test("ERA receipts and posted payments remain separate even when they match", () => {
   const sources = {
     claimId: "80751",
     transactions: [
@@ -345,9 +346,10 @@ test("ERA payments take precedence and a posting is counted only as fallback", (
   const result = buildClaimLifecycle(sources);
 
   assert.equal(result.summary.eraPaid, 100);
-  assert.equal(result.summary.postedPaymentFallback, 50);
+  assert.equal(result.summary.postedPaid, 150);
+  assert.equal(result.summary.receivedPaid, 100);
   assert.equal(result.summary.totalPaid, 150);
-  assert.equal(result.provenance.eraMatchedPostings, 1);
+  assert.equal(result.provenance.eraMatchedPostings, 0);
   assert.equal(result.provenance.duplicatesRemoved, 2);
   assert.equal(result.claim.createdAt, "2026-01-03");
   assert.deepEqual(result.claim.submissionReferences, ["80751A"]);
@@ -355,26 +357,118 @@ test("ERA payments take precedence and a posting is counted only as fallback", (
   assert.deepEqual(result.eras[0].observedSources, ["ClaimStatus ERA", "EDI 835 ERA"]);
   assert.equal(result.eras[0].paid, 100);
   assert.equal(result.eras[0].lineCount, 1);
-  assert.equal(
-    result.timeline.find((event) => event.paymentAuthority === "era")?.countedPayment,
-    100,
-  );
-  assert.equal(
-    result.timeline.find((event) => event.paymentAuthority === "era-matched-posting")?.countedPayment,
-    0,
-  );
-  assert.equal(
-    result.timeline.find((event) => event.paymentAuthority === "transaction-fallback")?.countedPayment,
-    50,
-  );
-  assert.deepEqual(
-    result.timeline.find((event) => event.paymentAuthority === "transaction-fallback")?.cptPayments,
-    [{ procedure: "99215", paid: 50 }],
-  );
+  const receipt = result.timeline.find((event) => event.paymentAuthority === "era");
+  assert.equal(receipt.countedPayment, 0);
+  assert.equal(receipt.receivedPayment, 100);
+  const postings = result.timeline.filter((event) => event.paymentAuthority === "posted");
+  assert.deepEqual(postings.map((event) => event.countedPayment), [100, 50]);
+  assert.deepEqual(postings[1].cptPayments, [{ procedure: "99215", paid: 50 }]);
+  assert.deepEqual(postings[1].procedures, ["99215"]);
+  assert.deepEqual(postings[1].cptActivity, [{
+    procedure: "99215",
+    lineCount: 1,
+    posted: 50,
+    received: 0,
+    billed: 500,
+    allowed: null,
+    patientResponsibility: null,
+    adjusted: null,
+    balance: 350,
+    adjustments: [],
+  }]);
   assert.ok(result.cptFinancials.some((cpt) => cpt.procedure === "99215" && cpt.charged === 500));
 });
 
-test("negative ERA amounts remain reversals in the net payment total", () => {
+test("claim vital sources retain original charges, latest Flatten touch, and submission attempts", () => {
+  const result = buildClaimLifecycle({
+    claimId: "80751",
+    transactions: [
+      transaction({
+        CLAIMTRANSACTIONID: "100",
+        POSTINGDATE: "2026-01-03",
+        CLAIMTRANSACTIONTYPENAME: "Claim created",
+        PROCEDURECODE: "78802",
+        Charges: "600.00",
+      }),
+      transaction({
+        CLAIMTRANSACTIONID: "101",
+        POSTINGDATE: "2026-01-03",
+        CLAIMTRANSACTIONTYPENAME: "Claim created",
+        PROCEDURECODE: "A9607",
+        Charges: "400.00",
+      }),
+      transaction({
+        CLAIMTRANSACTIONID: "102",
+        POSTINGDATE: "2026-01-20",
+        CLAIMTRANSACTIONTYPENAME: "Re-billed claim",
+        PROCEDURECODE: "78802",
+        Charges: "1,200.00",
+      }),
+    ],
+    claimStatus: [
+      claimStatus({ ClaimStatusId: 1, PatientControlNumber: "80751A" }),
+      claimStatus({ ClaimStatusId: 2, PatientControlNumber: "80751B", CheckEftTraceNumber: "TRACE-2" }),
+    ],
+    edi835: [],
+  });
+
+  assert.deepEqual(result.claimVitalSources, {
+    lastTransactionDate: "2026-01-20",
+    latestAppealRebillDate: "2026-01-20",
+    originalCharge: 1_000,
+    attempts: 2,
+    payerNames: ["Health Plan"],
+  });
+  assert.equal(result.summary.latestCharge, 1_200);
+});
+
+test("filing reset sources use actual dated appeal/rebill actions, not routine billing or ERA observations", () => {
+  const sources = {
+    claimId: "80751",
+    transactions: [
+      transaction({ CLAIMTRANSACTIONID: "1", POSTINGDATE: "2026-01-03", CLAIMTRANSACTIONTYPENAME: "Claim created" }),
+      transaction({ CLAIMTRANSACTIONID: "2", POSTINGDATE: "2026-01-10", CLAIMTRANSACTIONTYPENAME: "Re-billed" }),
+      transaction({ CLAIMTRANSACTIONID: "3", POSTINGDATE: "2026-01-15", CLAIMTRANSACTIONTYPENAME: "Appeal submitted" }),
+      transaction({ CLAIMTRANSACTIONID: "4", POSTINGDATE: "2026-01-17", CLAIMTRANSACTIONTYPENAME: "Appeal follow-up" }),
+      transaction({ CLAIMTRANSACTIONID: "5", POSTINGDATE: "2026-01-18", CLAIMTRANSACTIONTYPENAME: "Appeal planned" }),
+      transaction({ CLAIMTRANSACTIONID: "6", POSTINGDATE: "2026-01-19", CLAIMTRANSACTIONTYPENAME: "Billed" }),
+      transaction({ CLAIMTRANSACTIONID: "7", POSTINGDATE: null, CLAIMTRANSACTIONTYPENAME: "Re-billed claim" }),
+    ],
+    claimStatus: [claimStatus({ PatientControlNumber: "80751B", CheckEftDate: "2026-01-25" })],
+    edi835: [],
+  };
+  const result = buildClaimLifecycle(sources);
+  assert.equal(result.claimVitalSources.latestAppealRebillDate, "2026-01-15");
+  const vitals = buildClaimVitals(result, { referenceDate: "2026-01-20" });
+  assert.equal(vitals.filingStartDate, "2026-01-15");
+  assert.equal(vitals.filingLimitDate, "2026-04-15");
+  assert.equal(vitals.filingLimitDaysLeft, 85);
+
+  const noAction = buildClaimLifecycle({ ...sources, transactions: sources.transactions.slice(0, 1) });
+  assert.equal(noAction.claimVitalSources.latestAppealRebillDate, null);
+  assert.equal(buildClaimVitals(noAction).filingStartReason, "service_date");
+});
+
+test("AR counts charge/write-off snapshots once per line and payments once across posting and ERA", () => {
+  const result = buildClaimLifecycle({
+    claimId: "80751",
+    transactions: [
+      transaction({ CLAIMTRANSACTIONID: "1", POSTINGDATE: "2026-01-03", CLAIMTRANSACTIONTYPENAME: "Claim created", Adjustments: 50 }),
+      transaction({ CLAIMTRANSACTIONID: "2", POSTINGDATE: "2026-01-04", CLAIMTRANSACTIONTYPENAME: "Billed", Adjustments: 50 }),
+      transaction({ CLAIMTRANSACTIONID: "3", POSTINGDATE: "2026-01-20", CLAIMTRANSACTIONTYPENAME: "Applied payment", Amount: 100, Adjustments: 50 }),
+      transaction({ CLAIMTRANSACTIONID: "3", POSTINGDATE: "2026-01-20", CLAIMTRANSACTIONTYPENAME: "Applied payment", Amount: 100, Adjustments: 50 }),
+      transaction({ CLAIMTRANSACTIONID: "4", POSTINGDATE: "2026-01-03", CLAIMTRANSACTIONTYPENAME: "Claim created", PROCEDURECODE: "99215", Charges: 200, Adjustments: 25 }),
+    ],
+    claimStatus: [claimStatus()],
+    edi835: [edi()],
+  });
+  assert.equal(result.summary.charges, 700);
+  assert.equal(result.summary.adjustments, 75);
+  assert.equal(result.summary.totalPaid, 100);
+  assert.equal(buildClaimVitals(result).outstandingArAmount, 525);
+});
+
+test("negative ERA amounts reverse received payments without changing posted totals", () => {
   const result = buildClaimLifecycle({
     claimId: "80751",
     transactions: [
@@ -394,8 +488,35 @@ test("negative ERA amounts remain reversals in the net payment total", () => {
   });
 
   assert.equal(result.summary.eraPaid, 75);
-  assert.equal(result.summary.totalPaid, 75);
+  assert.equal(result.summary.receivedPaid, 75);
+  assert.equal(result.summary.totalPaid, 0);
   assert.ok(result.timeline.some((event) => event.title === "Payment reversed" && event.amount === -25));
+});
+
+test("claim summary reports days until aggregated payments reach half the latest charge", () => {
+  const result = buildClaimLifecycle({
+    claimId: "80751",
+    transactions: [transaction({
+      CLAIMTRANSACTIONID: "1",
+      POSTINGDATE: "2026-09-01",
+      DATEOFSERVICE: "2026-09-01",
+      CLAIMTRANSACTIONTYPENAME: "Claim created",
+      Charges: "1000.00",
+    }),
+      transaction({ CLAIMTRANSACTIONID: "2", CLAIMTRANSACTIONTYPENAME: "Applied payment", POSTINGDATE: "2026-09-06", Amount: 250, Charges: 1000 }),
+      transaction({ CLAIMTRANSACTIONID: "3", CLAIMTRANSACTIONTYPENAME: "Applied payment", POSTINGDATE: "2026-09-12", Amount: 250, Charges: 1000 }),
+    ],
+    claimStatus: [],
+    edi835: [
+      edi({ id: 1, trace_number: "TRACE-1", reference_id: "1", payment_date: "20260904", service_date: "20260901", charge_amount: "1000.00", paid_amount: "250.00" }),
+      edi({ id: 2, trace_number: "TRACE-2", reference_id: "2", payment_date: "20260910", service_date: "20260901", charge_amount: "1000.00", paid_amount: "250.00" }),
+    ],
+  });
+
+  assert.equal(result.summary.paidThresholdPercent, 50);
+  assert.equal(result.summary.paidThresholdAmount, 500);
+  assert.equal(result.summary.paidThresholdDate, "2026-09-12");
+  assert.equal(result.summary.daysToPaid, 11);
 });
 
 test("letter suffixes stay in one ENCOUNTERID claim while events remain chronological", () => {
@@ -509,18 +630,18 @@ test("Flatten service-line rows are displayed once per actual claim event", () =
   });
 
   const flattenEvents = result.timeline.filter((event) => event.source === "FlattenTransctions2");
-  for (const title of ["Claim created", "Billed", "Applied payment", "Adjusted charges", "Settled"]) {
+  for (const title of ["Claim created", "Billed", "Posted payment", "Adjusted charges", "Settled"]) {
     assert.equal(flattenEvents.filter((event) => event.title === title).length, 1);
   }
   assert.equal(flattenEvents.length, 5);
   assert.ok(flattenEvents.every((event) => !/\bCPT\b/.test(event.description)));
 
-  const payment = flattenEvents.find((event) => event.title === "Applied payment");
+  const payment = flattenEvents.find((event) => event.title === "Posted payment");
   assert.equal(payment.amount, 522.09);
   assert.match(payment.description, /6 service lines/);
-  assert.match(payment.description, /5 zero-dollar service lines not counted/);
-  assert.match(payment.description, /\$522\.09 from 1 service line counted as payment fallback/);
-  assert.equal(result.summary.postedPaymentFallback, 522.09);
+  assert.equal(payment.countedPayment, 522.09);
+  assert.equal(result.summary.postedPaid, 522.09);
+  assert.equal(result.summary.receivedPaid, 0);
 });
 
 test("ERA service lines are displayed as one remittance event", () => {
@@ -543,6 +664,14 @@ test("ERA service lines are displayed as one remittance event", () => {
   assert.equal(eraPayments[0].amount, 150);
   assert.match(eraPayments[0].description, /2 service lines/);
   assert.doesNotMatch(eraPayments[0].description, /\bCPT\b/);
+  assert.deepEqual(eraPayments[0].procedures, ["78802", "78832"]);
+  const cptActivity = eraPayments[0].cptActivity.find((item) => item.procedure === "78802");
+  assert.equal(cptActivity.lineCount, 1);
+  assert.equal(cptActivity.billed, 500);
+  assert.equal(cptActivity.received, 100);
+  assert.match(cptActivity.adjustments.join(" "), /45/);
+  const submission = result.timeline.find((event) => event.title === "Submission/correction/rebill observed");
+  assert.deepEqual(submission.procedures, ["78802", "78832"]);
   assert.equal(result.eras.length, 1);
   assert.equal(result.eras[0].source, "EDI 835 ERA");
   assert.equal(result.eras[0].lineCount, 2);

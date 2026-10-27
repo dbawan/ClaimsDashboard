@@ -12,7 +12,7 @@ export function ClaimProgressBar({ progress = [] }) {
         <span>Claim status</span>
         <strong>{current?.label || "Status available"}</strong>
       </header>
-      <ol>
+      <ol style={{ gridTemplateColumns: `repeat(${progress.length}, minmax(76px, 1fr))` }}>
         {progress.map((step) => (
           <li
             className={`claim-progress-step claim-progress-${step.state}`}

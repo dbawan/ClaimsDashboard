@@ -32,13 +32,13 @@ export function ClaimEraList({ data }) {
     <section className="era-list-card" aria-labelledby="era-list-heading">
       <div className="era-list-header">
         <div>
-          <p className="section-kicker">Authoritative remittances</p>
+          <p className="section-kicker">Payment received</p>
           <h2 id="era-list-heading">ERA records</h2>
-          <p>Reconciled ClaimStatus and 835 remittances used for the claim payment total.</p>
+          <p>AdvancedMD, ClaimStatus and 835 remittances, counted once as received payments. Posting is tracked separately.</p>
         </div>
         <div className="era-source-counts" aria-label="ERA record source counts">
           <span>{eras.length} remittance{eras.length === 1 ? "" : "s"}</span>
-          <small>{claimStatusCount} ClaimStatus · {edi835Count} EDI 835</small>
+          <small>{claimStatusCount} ClaimStatus · {edi835Count} EDI 835 · {eras.filter((era) => era.observedSources?.includes("AdvancedMD ERA")).length} AdvancedMD</small>
         </div>
       </div>
 
@@ -59,14 +59,16 @@ export function ClaimEraList({ data }) {
                   <h3>{era.title}</h3>
                 </div>
                 <div className="era-paid-total">
-                  <span>ERA paid</span>
+                  <span>Payment received</span>
                   <strong className={era.paid < 0 ? "amount-negative" : "amount-positive"}>
                     {formatMoney(era.paid)}
                   </strong>
                 </div>
               </div>
 
+              {era.postFailed ? <p className="era-adjustments">AdvancedMD reported a posting failure for this remittance.</p> : null}
               <dl className="era-facts">
+                {era.receivedAt ? <EraFact label="ERA received">{formatDate(era.receivedAt)}</EraFact> : null}
                 <EraFact label="Submission / rebill">{valueOrMissing(era.submissionReference)}</EraFact>
                 <EraFact label="Payer claim number">{valueOrMissing(era.payerClaimNumber)}</EraFact>
                 <EraFact label="Trace / check number">{valueOrMissing(era.traceNumber)}</EraFact>
@@ -101,7 +103,7 @@ export function ClaimEraList({ data }) {
                         <th scope="col">Line reference</th>
                         <th scope="col">Billed</th>
                         <th scope="col">Allowed</th>
-                        <th scope="col">Paid</th>
+                        <th scope="col">Received</th>
                         <th scope="col">Codes / details</th>
                       </tr>
                     </thead>
@@ -109,7 +111,7 @@ export function ClaimEraList({ data }) {
                       {era.serviceLines.map((line) => (
                         <tr key={line.id}>
                           <td>{formatDate(line.serviceDate)}</td>
-                          <td><strong>{procedureLabel(line)}</strong></td>
+                          <td><strong>{line.claimLevelOnly ? "Unallocated claim amount" : procedureLabel(line)}</strong></td>
                           <td>{valueOrMissing(line.units)}</td>
                           <td>{valueOrMissing(line.lineReference)}</td>
                           <td>{moneyOrMissing(line.billed)}</td>
@@ -129,8 +131,8 @@ export function ClaimEraList({ data }) {
         </div>
       ) : (
         <p className="era-list-empty">
-          No ClaimStatus or EDI 835 remittance was found for this claim. Any counted payment is a
-          FlattenTransctions2 fallback and remains identified as such in the graph and timeline.
+          No AdvancedMD, ClaimStatus or EDI 835 remittance was found for this claim.
+          Posted payments are shown separately from the billing ledger.
         </p>
       )}
     </section>

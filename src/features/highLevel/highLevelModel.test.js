@@ -4,11 +4,21 @@ import {
   appointmentMinimumAge,
   buildHoverSnapshot,
   buildTrack,
+  cptPaymentProgress,
   dateAtPosition,
   equalEventPosition,
   eventIndexForPosition,
   resolveDateRange,
 } from "./highLevelModel.js";
+
+test("CPT progress uses posted payments and handles overpayments, reversals and missing charges", () => {
+  assert.deepEqual(cptPaymentProgress({ latestCharge: 500, posted: 300, received: 450 }), { percent: 60, width: 60, excess: 0 });
+  assert.deepEqual(cptPaymentProgress({ latestCharge: 100, posted: 125 }), { percent: 125, width: 100, excess: 25 });
+  assert.deepEqual(cptPaymentProgress({ latestCharge: 100, posted: -25 }), { percent: -25, width: 0, excess: 0 });
+  for (const latestCharge of [0, null]) {
+    assert.deepEqual(cptPaymentProgress({ latestCharge, posted: 25 }), { percent: null, width: 0, excess: 0 });
+  }
+});
 
 test("appointment age filters support all, two weeks, and bounded custom days", () => {
   assert.equal(appointmentMinimumAge("all", 99), 0);

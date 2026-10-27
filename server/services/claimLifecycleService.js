@@ -1,4 +1,6 @@
+import { claimStatusEraRows, ediEraRows, advancedMdEraRows, distinctEraRows } from "../lib/eraReconciliation.js";
 import { withReadOnlySession } from "../db/readOnlyPool.js";
+import { config } from "../config.js";
 import {
   assertValidClaimSearch,
   centsToAmount,
@@ -10,27 +12,38 @@ import {
   submissionSuffix,
 } from "../lib/claimIdentity.js";
 import { PATIENT_INVOICE_CPT_MAPPINGS } from "../lib/patientInvoiceMatching.js";
+import { claimPaymentTiming } from "../lib/claimPaymentTiming.js";
 import { createTtlCache } from "../lib/ttlCache.js";
+import { CLAIM_CACHE_TTL_MS } from "../lib/dataCache.js";
 import { readClaimSources } from "../repositories/claimRepository.js";
 import {
   attachClaimCategorization,
   enrichClaimWithCategorization,
 } from "./claimCategorizationService.js";
 import { enrichClaimWithComments } from "./claimCommentService.js";
+import { attachClaimVitals } from "./claimVitalsService.js";
 
-export const MYSQL_CLAIM_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+export const MYSQL_CLAIM_CACHE_TTL_MS = CLAIM_CACHE_TTL_MS;
 const mysqlClaimCache = createTtlCache({ ttlMs: MYSQL_CLAIM_CACHE_TTL_MS });
+// Categorized-claim API data may follow the cached MySQL snapshot. Salesforce
+// comments deliberately bypass this cache and are loaded for every claim search.
+let claimCategorizations = new WeakMap();
+
+export function invalidateClaimEnrichments() {
+  claimCategorizations = new WeakMap();
+}
 
 const SOURCE_LABELS = Object.freeze({
   transaction: "FlattenTransctions2",
   claimStatus: "ClaimStatus ERA",
   edi835: "EDI 835 ERA",
+  advancedMd: "AdvancedMD ERA",
   priorAuthorization: "EHR prior authorization",
   patientInvoices: "Patient invoices",
   combined: "Combined sources",
 });
 
-const SOURCE_RANK = Object.freeze({ claimStatus: 0, edi835: 1, transaction: 2 });
+const SOURCE_RANK = Object.freeze({ advancedMd: 0, claimStatus: 1, edi835: 2, transaction: 3 });
 
 function text(value) {
   const result = String(value ?? "").trim();
@@ -88,6 +101,71 @@ function aggregateLineMoney(rows, field) {
   return [...lines.values()].reduce((total, cents) => total + cents, 0);
 }
 
+function originalClaimCharge(rows) {
+  const rowsWithCharges = rows.filter((row) => moneyToCents(row.Charges) != null);
+  if (!rowsWithCharges.length) return null;
+  const createdRows = rowsWithCharges.filter((row) => isClaimCreatedEvent(
+    row.CLAIMTRANSACTIONTYPENAME,
+  ));
+  if (createdRows.length) return centsToAmount(aggregateLineMoney(createdRows, "Charges"));
+
+  const billedRows = rowsWithCharges.filter((row) => (
+    /^(?:BILLED|REBILLEDCLAIM|REBILLED)$/.test(normalizeIdentifier(row.CLAIMTRANSACTIONTYPENAME))
+  ));
+  const candidates = billedRows.length ? billedRows : rowsWithCharges;
+  const earliestDate = firstDate(candidates.map((row) => normalizeDate(row.POSTINGDATE)));
+  const originalRows = earliestDate
+    ? candidates.filter((row) => normalizeDate(row.POSTINGDATE) === earliestDate)
+    : candidates;
+  return centsToAmount(aggregateLineMoney(originalRows, "Charges"));
+}
+
+function latestClaimCharge(rows) {
+  const rowsWithCharges = rows.filter((row) => moneyToCents(row.Charges) != null);
+  if (!rowsWithCharges.length) return 0;
+
+  const submissionRows = rowsWithCharges.filter((row) => (
+    /^(?:CLAIMCREATED|CREATEDCLAIM|BILLED|REBILLEDCLAIM|REBILLED)$/.test(
+      normalizeIdentifier(row.CLAIMTRANSACTIONTYPENAME),
+    )
+  ));
+  const candidates = submissionRows.length ? submissionRows : rowsWithCharges;
+  const latestDate = compact(
+    candidates.map((row) => normalizeDate(row.POSTINGDATE) || normalizeDate(row.DATEOFSERVICE)),
+  ).sort().at(-1);
+  const latestRows = latestDate
+    ? candidates.filter((row) => (
+      (normalizeDate(row.POSTINGDATE) || normalizeDate(row.DATEOFSERVICE)) === latestDate
+    ))
+    : candidates;
+  return centsToAmount(aggregateLineMoney(latestRows, "Charges"));
+}
+
+function claimAttemptCount(transactions, submissionReferences) {
+  if (submissionReferences.length) return submissionReferences.length;
+  const attemptKeys = new Set();
+  for (const row of transactions) {
+    const transactionType = normalizeIdentifier(row.CLAIMTRANSACTIONTYPENAME);
+    if (!/^(?:BILLED|REBILLEDCLAIM|REBILLED)$/.test(transactionType)) continue;
+    const date = normalizeDate(row.POSTINGDATE) || normalizeDate(row.DATEOFSERVICE);
+    attemptKeys.add(stableKey([date, transactionType]));
+  }
+  return attemptKeys.size;
+}
+
+function latestAppealRebillDate(transactions) {
+  // Use recorded actions, not ERA suffix observations or planned/status activity.
+  const actionTypes = new Set([
+    "REBILLED", "REBILLEDCLAIM", "CLAIMREBILLED",
+    "CORRECTEDCLAIM", "CLAIMCORRECTED", "RESUBMITTEDCLAIM", "CLAIMRESUBMITTED",
+    "APPEALSUBMITTED", "SUBMITTEDAPPEAL", "APPEALFILED", "FILEDAPPEAL", "APPEALSENT",
+  ]);
+  return compact(transactions
+    .filter((row) => actionTypes.has(normalizeIdentifier(row.CLAIMTRANSACTIONTYPENAME)))
+    .map((row) => normalizeDate(row.POSTINGDATE)))
+    .sort().at(-1) || null;
+}
+
 function cptChargeSummary(rows) {
   const serviceLines = new Map();
   for (const row of rows) {
@@ -104,47 +182,37 @@ function cptChargeSummary(rows) {
       normalizedMoney(row.Charges),
     ]);
     if (!serviceLines.has(key)) {
+      const units = Number(row.UNIT);
       serviceLines.set(key, {
         procedure,
         chargeCents: moneyToCents(row.Charges) || 0,
+        units: Number.isFinite(units) && units > 0 ? units : 1,
       });
     }
   }
 
   const byProcedure = new Map();
   for (const line of serviceLines.values()) {
-    byProcedure.set(
-      line.procedure,
-      (byProcedure.get(line.procedure) || 0) + line.chargeCents,
-    );
+    const current = byProcedure.get(line.procedure) || { chargeCents: 0, units: 0 };
+    current.chargeCents += line.chargeCents;
+    current.units += line.units;
+    byProcedure.set(line.procedure, current);
   }
   return [...byProcedure]
-    .map(([procedure, chargeCents]) => ({ procedure, charged: centsToAmount(chargeCents) }))
+    .map(([procedure, { chargeCents, units }]) => ({
+      procedure,
+      charged: centsToAmount(chargeCents),
+      units,
+    }))
     .sort((left, right) => right.charged - left.charged
       || left.procedure.localeCompare(right.procedure));
 }
 
-function parseAdjustmentCodes(value) {
-  if (!value) return [];
-  try {
-    const parsed = typeof value === "string" ? JSON.parse(value) : value;
-    if (!Array.isArray(parsed)) return [String(value)];
-    return parsed.map((item) =>
-      [item.group, item.reason, item.amount].filter((entry) => entry != null).join(" "),
-    );
-  } catch {
-    return String(value).split(",").map((item) => item.trim()).filter(Boolean);
-  }
-}
-
-function adjustmentText(value) {
-  return parseAdjustmentCodes(value).join(", ");
-}
 
 function isPaymentEvent(eventType) {
   const value = String(eventType ?? "").toLowerCase();
   if (/patient responsibility|copay|coinsurance|deductible/.test(value)) return false;
-  return /applied payment|payment applied|insurance payment|payment posted|payment received|remittance payment|paid transaction|receipt|payment/.test(value);
+  return /^(applied payment|payment applied|insurance payment|payment posted|payment received|remittance payment|paid transaction|receipt|payment reversal|voided payment)$/.test(value.trim());
 }
 
 function isClaimCreatedEvent(eventType) {
@@ -168,7 +236,7 @@ function eventStatus(title, amountCents = 0) {
 
 function transactionSignature(row) {
   const transactionId = normalizeIdentifier(row.CLAIMTRANSACTIONID);
-  if (transactionId) return stableKey(["id", transactionId]);
+  if (transactionId) return stableKey(["id", row.EHR, row.CLAIMTRANSACTIONTYPENAME, transactionId, row.PAYMENTID, row.PAYMENTCLAIMID]);
   return stableKey([
     "content",
     dateTime(row.POSTINGDATE),
@@ -217,7 +285,7 @@ function transactionEvents(rows) {
     const transactionType = normalizeIdentifier(title);
     const paymentEvent = isPaymentEvent(title);
     const amountCents = paymentEvent
-      ? moneyToCents(row.Amount) ?? moneyToCents(row.Receipt) ?? moneyToCents(row.pay)
+      ? moneyToCents(row.Amount)
       : null;
     const procedure = normalizeIdentifier(row.PROCEDURECODE);
     const modifier = normalizeIdentifier(row.MOD1 || row.Modifiers);
@@ -235,6 +303,9 @@ function transactionEvents(rows) {
     group.rows.push(row);
     group.lines.push({
       amountCents,
+      chargeCents: moneyToCents(row.Charges),
+      adjustedCents: moneyToCents(row.Adjustments),
+      balanceCents: moneyToCents(row.Balance),
       serviceDate: normalizeDate(row.DATEOFSERVICE),
       procedure,
       modifier,
@@ -267,159 +338,25 @@ function transactionEvents(rows) {
       id: `transaction-event-${index}-${normalizeIdentifier(group.title)}`,
       date: dateTime(first.POSTINGDATE) || normalizeDate(first.DATEOFSERVICE),
       sortOrder: isClaimCreatedEvent(group.title) ? 0 : 30,
-      title: isClaimCreatedEvent(group.title) ? "Claim created" : group.title,
+      title: isClaimCreatedEvent(group.title) ? "Claim created" : group.paymentEvent
+        ? amountCents < 0 ? "Posted payment reversed" : "Posted payment" : group.title,
       description: details.join(" · ") || "Activity recorded in FlattenTransctions2.",
       source: SOURCE_LABELS.transaction,
       sourceType: "transaction",
       status: eventStatus(group.title, amountCents || 0),
       amountCents,
-      countedPaymentCents: 0,
+      countedPaymentCents: group.paymentEvent ? amountCents || 0 : 0,
       lineReferences: compact(group.lines.flatMap((line) => line.lineReferences)),
       transactionType: group.transactionType,
       paymentEvent: group.paymentEvent,
       lines: group.lines,
-      paymentAuthority: "informational",
+      paymentAuthority: group.paymentEvent ? "posted" : "informational",
     };
   });
-
-  return { events, duplicateCount };
-}
-
-function claimStatusEraRows(rows) {
-  return rows.map((row, index) => ({
-    rowId: text(row.ClaimStatusId) || String(index),
-    sourceType: "claimStatus",
-    source: SOURCE_LABELS.claimStatus,
-    sourceRank: SOURCE_RANK.claimStatus,
-    claimReference: text(row.PatientControlNumber),
-    payerClaimControl: text(row.ClaimNumber),
-    patientName: text(row.PatientName),
-    createdAt: dateTime(row.ImportedAtUtc),
-    eventDate: dateTime(row.CheckEftDate) || dateTime(row.EobTransactionDate)
-      || dateTime(row.ImportedAtUtc) || normalizeDate(row.DateOfServiceStart),
-    serviceDate: normalizeDate(row.DateOfServiceStart),
-    procedure: normalizeIdentifier(row.AdjudProcedure || row.SubProcedure),
-    modifier: normalizeIdentifier(row.AdjudModifier || row.SubModifier),
-    units: normalizedUnits(row.AdjudUnits || row.SubUnits),
-    lineNumber: text(row.LineControlNumber),
-    chargeCents: moneyToCents(row.ChargeAmount),
-    paidCents: moneyToCents(row.Payment) || 0,
-    primaryPaidCents: null,
-    allowedCents: moneyToCents(row.AllowedAmount),
-    adjustment: text(row.AdjustmentCodes) || text(row.ChargeAdjustments) || "",
-    payer: text(row.PayerName),
-    remitId: text(row.CheckEftTraceNumber),
-  }));
-}
-
-function ediEraRows(rows) {
-  return rows.map((row, index) => ({
-    rowId: text(row.id) || String(index),
-    sourceType: "edi835",
-    source: SOURCE_LABELS.edi835,
-    sourceRank: SOURCE_RANK.edi835,
-    claimReference: text(row.patient_control_number),
-    payerClaimControl: text(row.payer_claim_control),
-    patientName: compact([row.patient_first, row.patient_last]).join(" ") || null,
-    createdAt: normalizeDate(row.claim_received_date),
-    eventDate: normalizeDate(row.payment_date) || normalizeDate(row.claim_received_date)
-      || normalizeDate(row.service_date || row.statement_from_date),
-    serviceDate: normalizeDate(row.service_date || row.statement_from_date),
-    procedure: normalizeIdentifier(row.service_code),
-    modifier: normalizeIdentifier(row.modifiers),
-    units: normalizedUnits(row.units),
-    lineNumber: text(row.reference_id),
-    chargeCents: moneyToCents(row.charge_amount),
-    paidCents: moneyToCents(row.paid_amount) || 0,
-    primaryPaidCents: null,
-    allowedCents: moneyToCents(row.allowed_amount),
-    adjustment: adjustmentText(row.service_adjustments),
-    payer: text(row.payer_name),
-    remitId: text(row.trace_number),
-  }));
-}
-
-function lineKey(row) {
-  return stableKey([
-    row.serviceDate,
-    row.procedure,
-    row.modifier,
-    row.units,
-  ]);
-}
-
-function lineCompatible(left, right) {
-  if (left.serviceDate && right.serviceDate && left.serviceDate !== right.serviceDate) return false;
-  if (left.procedure && right.procedure && left.procedure !== right.procedure) return false;
-  if (left.modifier && right.modifier && left.modifier !== right.modifier) return false;
-  if (left.units && right.units && left.units !== right.units) return false;
-  if (left.procedure && right.procedure) return true;
-  return Boolean(
-    left.lineNumber
-    && right.lineNumber
-    && normalizeIdentifier(left.lineNumber) === normalizeIdentifier(right.lineNumber),
-  );
-}
-
-function eraSignature(row) {
-  return stableKey([
-    row.sourceType,
-    row.eventDate,
-    lineKey(row),
-    normalizeIdentifier(row.lineNumber),
-    row.chargeCents,
-    row.paidCents,
-    row.primaryPaidCents,
-    row.allowedCents,
-    normalizeIdentifier(row.payer),
-    normalizeIdentifier(row.remitId),
-    row.adjustment,
-  ]);
-}
-
-function distinctEraRows(rows) {
-  const seenWithinSource = new Set();
-  const result = [];
-  let duplicateCount = 0;
-
-  for (const row of [...rows].sort((left, right) => left.sourceRank - right.sourceRank)) {
-    const signature = eraSignature(row);
-    if (seenWithinSource.has(signature)) {
-      duplicateCount += 1;
-      continue;
-    }
-    seenWithinSource.add(signature);
-
-    const crossDuplicate = result.find((other) => {
-      if (other.sourceType === row.sourceType || !lineCompatible(other, row)) return false;
-      const samePayment = other.paidCents === row.paidCents;
-      const sameRemit = Boolean(
-        other.remitId
-        && row.remitId
-        && normalizeIdentifier(other.remitId) === normalizeIdentifier(row.remitId),
-      );
-      const sameDate = Boolean(other.eventDate && row.eventDate && other.eventDate === row.eventDate);
-      const samePayer = Boolean(
-        other.payer
-        && row.payer
-        && normalizeIdentifier(other.payer) === normalizeIdentifier(row.payer),
-      );
-      const sameAdjustment = String(other.adjustment).toUpperCase() === String(row.adjustment).toUpperCase();
-      return samePayment && (sameRemit || (sameDate && samePayer && sameAdjustment));
-    });
-
-    if (crossDuplicate) {
-      duplicateCount += 1;
-      crossDuplicate.observedSources = compact([
-        ...(crossDuplicate.observedSources || [crossDuplicate.source]),
-        row.source,
-      ]);
-    } else {
-      result.push({ ...row, observedSources: [row.source] });
-    }
+  for (const event of events) for (const line of event.lines) {
+    line.countedPaymentCents = event.paymentEvent ? line.amountCents || 0 : 0;
   }
-
-  return { rows: result, duplicateCount };
+  return { events, duplicateCount };
 }
 
 function formattedCents(cents) {
@@ -434,6 +371,7 @@ function buildEraRecords(rows) {
   for (const row of rows) {
     const key = stableKey([
       row.sourceType,
+      row.remittanceKey || "",
       row.claimReference,
       row.payerClaimControl,
       row.remitId,
@@ -470,6 +408,9 @@ function buildEraRecords(rows) {
     return {
       id: `era-record-${first.sourceType}-${index}`,
       date: first.eventDate,
+      receivedAt: first.receivedAt || null,
+      postFailed: groupRows.some((row) => row.postFailed),
+      dismissedAt: first.dismissedAt || null,
       title,
       source: first.source,
       sourceType: first.sourceType,
@@ -496,6 +437,10 @@ function buildEraRecords(rows) {
         allowedCents: row.allowedCents,
         paidCents: row.paidCents,
         adjustment: row.adjustment || null,
+        flattenedClaimId: row.flattenedClaimId || null,
+        claimLevelOnly: Boolean(row.claimLevelOnly),
+        patientResponsibilityCents: row.patientResponsibilityCents ?? null,
+        adjustedCents: row.adjustedCents ?? null,
       })),
     };
   }).sort((left, right) => compareEvents(
@@ -527,85 +472,25 @@ function eraEvents(records) {
       sourceType: record.sourceType,
       status: record.status,
       amountCents: record.paidCents,
-      countedPaymentCents: record.paidCents,
+      countedPaymentCents: 0,
+      receivedPaymentCents: record.paidCents,
       lineReferences: record.lineReferences,
       paymentAuthority: "era",
       traceNumber: record.traceNumber,
       claimReference: record.claimReference,
       cptPaymentLines: record.serviceLines.map((line) => ({
         procedure: line.procedure,
-        countedPaymentCents: line.paidCents,
+        countedPaymentCents: 0,
+        receivedPaymentCents: line.paidCents,
+        chargeCents: line.chargeCents,
+        allowedCents: line.allowedCents,
+        patientResponsibilityCents: line.patientResponsibilityCents,
+        adjustedCents: line.adjustedCents,
+        adjustment: line.adjustment,
+        units: line.units,
       })),
     };
   });
-}
-
-function paymentLineCompatible(transaction, era) {
-  if (transaction.serviceDate && era.serviceDate && transaction.serviceDate !== era.serviceDate) {
-    return false;
-  }
-  if (
-    transaction.amountCents != null
-    && transaction.amountCents !== 0
-    && era.paidCents !== 0
-    && transaction.amountCents === era.paidCents
-  ) return true;
-  if (!transaction.procedure || !era.procedure) return lineCompatible(transaction, era);
-  if (transaction.procedure !== era.procedure) return false;
-  if (transaction.modifier && era.modifier && transaction.modifier !== era.modifier) return false;
-  return true;
-}
-
-function reconcilePayments(transactionTimeline, eraRows) {
-  const nonzeroEraRows = eraRows.filter((row) => row.paidCents !== 0);
-  let fallbackCents = 0;
-  let matchedPostingCount = 0;
-
-  for (const event of transactionTimeline) {
-    if (!event.paymentEvent) continue;
-    let matchedLineCount = 0;
-    let fallbackLineCount = 0;
-    let zeroLineCount = 0;
-    let unavailableLineCount = 0;
-    let eventFallbackCents = 0;
-
-    for (const line of event.lines) {
-      const authoritativeMatch = line.procedure || line.lineNumber
-        ? nonzeroEraRows.some((era) => paymentLineCompatible(line, era))
-        : nonzeroEraRows.length > 0;
-      if (authoritativeMatch) matchedLineCount += 1;
-
-      if (line.amountCents == null) {
-        if (!authoritativeMatch) unavailableLineCount += 1;
-      } else if (line.amountCents === 0) {
-        zeroLineCount += 1;
-      } else if (!authoritativeMatch) {
-        fallbackLineCount += 1;
-        eventFallbackCents += line.amountCents;
-        line.countedPaymentCents = line.amountCents;
-      }
-    }
-
-    if (matchedLineCount > 0) {
-      matchedPostingCount += 1;
-      event.paymentAuthority = "era-matched-posting";
-      event.description += ` · ${matchedLineCount} service line${matchedLineCount === 1 ? "" : "s"} kept as posting-only because matching non-zero ERA data is authoritative.`;
-    }
-    if (fallbackLineCount > 0) {
-      event.paymentAuthority = "transaction-fallback";
-      fallbackCents += eventFallbackCents;
-      event.countedPaymentCents = eventFallbackCents;
-      event.description += ` · ${formattedCents(eventFallbackCents)} from ${fallbackLineCount} service line${fallbackLineCount === 1 ? "" : "s"} counted as payment fallback because no matching non-zero ERA was found.`;
-    }
-    if (zeroLineCount > 0) {
-      event.description += ` · ${zeroLineCount} zero-dollar service line${zeroLineCount === 1 ? "" : "s"} not counted as payment.`;
-    }
-    if (unavailableLineCount > 0) {
-      event.description += ` · ${unavailableLineCount} service line${unavailableLineCount === 1 ? " has" : "s have"} no available payment amount and no matching non-zero ERA.`;
-    }
-  }
-
-  return { fallbackCents, matchedPostingCount };
 }
 
 function transactionPatientNames(rows) {
@@ -650,7 +535,8 @@ function buildSubmissionEvents(claimId, transactions, sourceEraRows) {
     const sources = compact(rows.map((row) => row.source)).sort();
     const changes = [];
 
-    if (stableKey([...patientKeys].sort()) !== stableKey([...anchorPatientKeys].sort())) {
+    if (patientKeys.size && anchorPatientKeys.size
+      && stableKey([...patientKeys].sort()) !== stableKey([...anchorPatientKeys].sort())) {
       changes.push(
         `patient text differs (Flatten: ${anchorPatientValues.join(", ") || "missing"}; ERA: ${patientValues.join(", ") || "missing"})`,
       );
@@ -690,11 +576,12 @@ function buildSubmissionEvents(claimId, transactions, sourceEraRows) {
       paymentAuthority: "informational",
       submissionReference: reference,
       submissionSuffix: suffix,
+      procedures: [...cpts].sort(),
     };
   });
 
   if (references.length === 0) {
-    warnings.push("No ERA submission/rebill reference matched ENCOUNTERID; transaction payments are fallback data");
+    warnings.push("No ERA submission/rebill reference matched ENCOUNTERID; received payment data is unavailable. Posted payments remain available from the billing ledger.");
   } else if (references.length > 1) {
     warnings.push(`Linked ${references.length} ERA submission/rebill references to one ENCOUNTERID claim`);
   }
@@ -730,12 +617,82 @@ function compareEvents(left, right) {
 }
 
 function publicEvent(event) {
-  const cptPayments = (event.cptPaymentLines || event.lines || [])
+  const activityLines = event.cptPaymentLines || event.lines || [];
+  const cptPayments = activityLines
     .filter((line) => line.procedure && line.countedPaymentCents)
     .map((line) => ({
       procedure: line.procedure,
       paid: centsToAmount(line.countedPaymentCents),
     }));
+  const activityByProcedure = new Map();
+  for (const line of activityLines) {
+    const procedure = normalizeIdentifier(line.procedure);
+    if (!procedure) continue;
+    if (!activityByProcedure.has(procedure)) {
+      activityByProcedure.set(procedure, {
+        procedure,
+        lineCount: 0,
+        postedCents: 0,
+        receivedCents: 0,
+        billedCents: 0,
+        allowedCents: 0,
+        patientResponsibilityCents: 0,
+        adjustedCents: 0,
+        balanceCents: 0,
+        billedKnown: false,
+        allowedKnown: false,
+        patientResponsibilityKnown: false,
+        adjustedKnown: false,
+        balanceKnown: false,
+        adjustments: [],
+      });
+    }
+    const activity = activityByProcedure.get(procedure);
+    activity.lineCount += 1;
+    activity.postedCents += line.countedPaymentCents || 0;
+    activity.receivedCents += line.receivedPaymentCents || 0;
+    if (line.chargeCents != null) {
+      activity.billedKnown = true;
+      activity.billedCents += line.chargeCents;
+    }
+    if (line.allowedCents != null) {
+      activity.allowedKnown = true;
+      activity.allowedCents += line.allowedCents;
+    }
+    if (line.patientResponsibilityCents != null) {
+      activity.patientResponsibilityKnown = true;
+      activity.patientResponsibilityCents += line.patientResponsibilityCents;
+    }
+    if (line.adjustedCents != null) {
+      activity.adjustedKnown = true;
+      activity.adjustedCents += line.adjustedCents;
+    }
+    if (line.balanceCents != null) {
+      activity.balanceKnown = true;
+      activity.balanceCents += line.balanceCents;
+    }
+    if (line.adjustment && !activity.adjustments.includes(line.adjustment)) {
+      activity.adjustments.push(line.adjustment);
+    }
+  }
+  const procedures = compact([
+    ...(event.procedures || []),
+    ...activityByProcedure.keys(),
+  ]).sort();
+  const cptActivity = [...activityByProcedure.values()].map((activity) => ({
+    procedure: activity.procedure,
+    lineCount: activity.lineCount,
+    posted: centsToAmount(activity.postedCents),
+    received: centsToAmount(activity.receivedCents),
+    billed: activity.billedKnown ? centsToAmount(activity.billedCents) : null,
+    allowed: activity.allowedKnown ? centsToAmount(activity.allowedCents) : null,
+    patientResponsibility: activity.patientResponsibilityKnown
+      ? centsToAmount(activity.patientResponsibilityCents)
+      : null,
+    adjusted: activity.adjustedKnown ? centsToAmount(activity.adjustedCents) : null,
+    balance: activity.balanceKnown ? centsToAmount(activity.balanceCents) : null,
+    adjustments: activity.adjustments,
+  }));
   return {
     id: event.id,
     date: event.date,
@@ -745,8 +702,13 @@ function publicEvent(event) {
     status: event.status,
     amount: event.amountCents == null ? null : centsToAmount(event.amountCents),
     countedPayment: centsToAmount(event.countedPaymentCents || 0),
+    receivedPayment: centsToAmount(event.receivedPaymentCents || 0),
+    cptReceived: (event.cptPaymentLines || []).filter((line) => line.receivedPaymentCents)
+      .map((line) => ({ procedure: line.procedure || "UNALLOCATED", paid: centsToAmount(line.receivedPaymentCents) })),
     paymentAuthority: event.paymentAuthority,
     submissionReference: event.submissionReference || null,
+    procedures,
+    cptActivity,
     cptPayments,
   };
 }
@@ -755,6 +717,9 @@ function publicEraRecord(record) {
   return {
     id: record.id,
     date: record.date,
+    receivedAt: record.receivedAt,
+    postFailed: record.postFailed,
+    dismissedAt: record.dismissedAt,
     title: record.title,
     source: record.source,
     sourceType: record.sourceType,
@@ -781,6 +746,10 @@ function publicEraRecord(record) {
       allowed: line.allowedCents == null ? null : centsToAmount(line.allowedCents),
       paid: centsToAmount(line.paidCents),
       adjustment: line.adjustment,
+      flattenedClaimId: line.flattenedClaimId,
+      claimLevelOnly: line.claimLevelOnly,
+      patientResponsibility: line.patientResponsibilityCents == null ? null : centsToAmount(line.patientResponsibilityCents),
+      adjusted: line.adjustedCents == null ? null : centsToAmount(line.adjustedCents),
     })),
   };
 }
@@ -998,7 +967,10 @@ function buildClaimProgress({ sources, claim, summary, eraRecords, priorAuthoriz
     "Denial",
     "Rejected",
   );
-  const paymentPosted = summary.totalPaid !== 0 || hasType("Applied payment");
+  const postingDates = sources.transactions.filter((row) => isPaymentEvent(row.CLAIMTRANSACTIONTYPENAME) && (moneyToCents(row.Amount) || 0) > 0)
+    .map((row) => normalizeDate(row.POSTINGDATE)).filter(Boolean).sort();
+  const paymentPosted = postingDates.length > 0;
+  const paymentReceived = eraRecords.some((record) => record.paidCents > 0);
   const visitCompleted = submitted || hasType("Claim created");
   const visitScheduled = visitCompleted || Boolean(
     claim.serviceDate || priorAuthorizations.some((authorization) => authorization.appointment.date),
@@ -1049,10 +1021,16 @@ function buildClaimProgress({ sources, claim, summary, eraRecords, priorAuthoriz
       detail: latestEra?.date || null,
     },
     {
+      key: "payment-received",
+      label: "Payment received",
+      achieved: paymentReceived,
+      detail: paymentReceived ? eraRecords.filter((record) => record.paidCents > 0).at(-1)?.date : null,
+    },
+    {
       key: "payment-posting",
-      label: "Payment posting",
+      label: "Posted payment",
       achieved: paymentPosted,
-      detail: paymentPosted ? latestEra?.date || claim.lastActivityAt : null,
+      detail: postingDates.at(-1) || null,
     },
     {
       key: "denied",
@@ -1068,6 +1046,7 @@ function buildClaimProgress({ sources, claim, summary, eraRecords, priorAuthoriz
   if (visitCompleted) currentKey = "visit-completed";
   if (submitted) currentKey = "payer-pending";
   if (adjudicated) currentKey = "adjudicated";
+  if (paymentReceived) currentKey = "payment-received";
   if (paymentPosted) currentKey = "payment-posting";
   if (denied) currentKey = "denied";
 
@@ -1082,16 +1061,17 @@ function buildClaimProgress({ sources, claim, summary, eraRecords, priorAuthoriz
 export function buildClaimLifecycle(sources) {
   const transactionResult = transactionEvents(sources.transactions);
   const sourceEraRows = [
+    ...advancedMdEraRows(sources.advancedMdEra),
     ...claimStatusEraRows(sources.claimStatus),
     ...ediEraRows(sources.edi835),
   ].filter((row) => submissionSuffix(sources.claimId, row.claimReference) !== null);
   const distinctEras = distinctEraRows(sourceEraRows);
   const eraRecords = buildEraRecords(distinctEras.rows);
   const eraTimeline = eraEvents(eraRecords);
-  const reconciliation = reconcilePayments(transactionResult.events, distinctEras.rows);
+  const postedCents = transactionResult.events.reduce((total, event) => total + event.countedPaymentCents, 0);
   const submissions = buildSubmissionEvents(sources.claimId, sources.transactions, sourceEraRows);
   const eraCents = distinctEras.rows.reduce((total, row) => total + row.paidCents, 0);
-  const totalPaidCents = eraCents + reconciliation.fallbackCents;
+  const totalPaidCents = postedCents;
   const timeline = [
     ...transactionResult.events,
     ...serviceEvents(sources.transactions),
@@ -1126,18 +1106,20 @@ export function buildClaimLifecycle(sources) {
     ...sources.transactions.flatMap((row) => [row.PayerPlan1, row.CompanyName1]),
     ...sourceEraRows.map((row) => row.payer),
   ]).sort();
+  const reimbursementPayerNames = compact([
+    ...sources.transactions.flatMap((row) => [row.CompanyName1, row.PayerPlan1]),
+    ...sourceEraRows.map((row) => row.payer),
+  ]);
   const warnings = [...submissions.warnings];
   if (!created) warnings.push("No explicit claim-created event; first-known date is derived");
   if (distinctEras.duplicateCount) warnings.push(`Removed ${distinctEras.duplicateCount} duplicate ERA row(s)`);
   if (transactionResult.duplicateCount) warnings.push(`Removed ${transactionResult.duplicateCount} duplicate transaction row(s)`);
-  if (reconciliation.matchedPostingCount) {
-    warnings.push(`Kept ${reconciliation.matchedPostingCount} payment posting(s) informational; ERA amounts were counted`);
-  }
 
   const sourceNames = [
     sources.transactions.length && SOURCE_LABELS.transaction,
     sources.claimStatus.length && SOURCE_LABELS.claimStatus,
     sources.edi835.length && SOURCE_LABELS.edi835,
+    sources.advancedMdEra?.length && SOURCE_LABELS.advancedMd,
     sources.priorAuthorizations?.length && SOURCE_LABELS.priorAuthorization,
     sources.patientInvoices?.length && SOURCE_LABELS.patientInvoices,
   ].filter(Boolean);
@@ -1183,21 +1165,44 @@ export function buildClaimLifecycle(sources) {
     createdAtBasis: firstKnownBasis,
     submittedAt: submissions.events[0]?.date || null,
     lastActivityAt: datedEvents.at(-1)?.date || null,
-    status: latestTransaction?.title || (totalPaidCents !== 0 ? "Payment received" : "Claim located"),
+    status: latestTransaction?.title || (totalPaidCents !== 0 ? "Posted payment" : eraCents !== 0 ? "Payment received" : "Claim located"),
   };
   const summary = {
     charges: centsToAmount(aggregateLineMoney(sources.transactions, "Charges")),
+    latestCharge: latestClaimCharge(sources.transactions),
     adjustments: centsToAmount(aggregateLineMoney(sources.transactions, "Adjustments")),
     balance: centsToAmount(aggregateLineMoney(sources.transactions, "Balance")),
     totalPaid: centsToAmount(totalPaidCents),
     eraPaid: centsToAmount(eraCents),
-    postedPaymentFallback: centsToAmount(reconciliation.fallbackCents),
+    postedPaid: centsToAmount(postedCents),
+    receivedPaid: centsToAmount(eraCents),
     eventCount: timeline.length,
   };
+  Object.assign(summary, claimPaymentTiming({
+    createdAt: firstKnown,
+    latestCharge: summary.latestCharge,
+    payments: timeline.map((event) => ({
+      date: event.date,
+      amount: centsToAmount(event.countedPaymentCents || 0),
+    })),
+    thresholdPercent: config.claims.paidThresholdPercent,
+  }));
+  const transactionDates = compact(
+    sources.transactions.map((row) => normalizeDate(row.POSTINGDATE)),
+  ).sort();
+  const cptFinancials = cptChargeSummary(sources.transactions);
+  const claimVitalSources = Object.freeze({
+    lastTransactionDate: transactionDates.at(-1) || null,
+    latestAppealRebillDate: latestAppealRebillDate(sources.transactions),
+    originalCharge: originalClaimCharge(sources.transactions),
+    attempts: claimAttemptCount(sources.transactions, submissions.references),
+    payerNames: Object.freeze(reimbursementPayerNames),
+  });
 
   return {
     claim,
     summary,
+    claimVitalSources,
     progress: buildClaimProgress({ sources, claim, summary, eraRecords, priorAuthorizations }),
     priorAuthorizations,
     patientInvoices,
@@ -1223,7 +1228,7 @@ export function buildClaimLifecycle(sources) {
       message: invoiceLookup.message,
     },
     eras: eraRecords.map(publicEraRecord),
-    cptFinancials: cptChargeSummary(sources.transactions),
+    cptFinancials,
     timeline: timeline.map(publicEvent),
     warnings,
     provenance: {
@@ -1231,35 +1236,73 @@ export function buildClaimLifecycle(sources) {
       transactionRows: sources.transactions.length,
       claimStatusRows: sources.claimStatus.length,
       edi835Rows: sources.edi835.length,
+      advancedMdEraRows: sources.advancedMdEra?.length || 0,
       priorAuthorizationRows: sources.priorAuthorizations?.length || 0,
       patientInvoiceRows: sources.patientInvoices?.length || 0,
       duplicatesRemoved: distinctEras.duplicateCount + transactionResult.duplicateCount,
-      eraMatchedPostings: reconciliation.matchedPostingCount,
+      eraMatchedPostings: 0,
       paymentRule:
-        "ClaimStatus and edi_835 ERA amounts are authoritative. FlattenTransctions2 payments are counted only when no matching non-zero ERA exists.",
+        "Posted payments come only from FlattenTransctions2. Payments received come from deduplicated AdvancedMD, ClaimStatus and edi_835 remittances. Received and posted amounts are never added together.",
       matchRule:
         "FlattenTransctions2.ENCOUNTERID is the claim ID. ERA references join only when they equal that ENCOUNTERID plus a letter-only correction/rebill suffix; patient, DOS, and CPT never determine claim membership.",
     },
   };
 }
 
-export async function getClaimLifecycle(searchId) {
+export async function getBaseClaimLifecycle(searchId, options = {}) {
   const validated = assertValidClaimSearch(searchId);
   const cacheKey = normalizeIdentifier(validated) || validated.toUpperCase();
-  const lifecycle = await mysqlClaimCache.getOrLoad(
+  const cache = options.cache || mysqlClaimCache;
+  const run = options.withReadOnlySession || withReadOnlySession;
+  const read = options.readClaimSources || readClaimSources;
+  return cache.getOrLoad(
     cacheKey,
-    () => withReadOnlySession(async (session) => {
-      const sources = await readClaimSources(session, validated);
+    () => run(async (session) => {
+      const sources = await read(session, validated);
       return buildClaimLifecycle(sources);
     }),
     (stage, details) => console.info(`[mysql-cache:claim] ${stage}`, details),
   );
+}
+
+async function categorizedClaimLifecycle(lifecycle, options = {}) {
+  const cache = claimCategorizations;
+  if (!cache.has(lifecycle)) {
+    const pending = Promise.resolve()
+      .then(() => (options.enrichClaimWithCategorization || enrichClaimWithCategorization)(lifecycle))
+      .then((enriched) => {
+        // A temporary integration failure must remain retryable on the next request.
+        if (/error|failed|timeout|unavailable|unauthorized/.test(
+          enriched.categorizationIntegration?.status || "",
+        )) cache.delete(lifecycle);
+        return enriched;
+      })
+      .catch((error) => {
+        cache.delete(lifecycle);
+        throw error;
+      });
+    cache.set(lifecycle, pending);
+  }
+  return cache.get(lifecycle);
+}
+
+export async function getCachedClaimLifecycle(searchId, options = {}) {
+  const lifecycle = await (options.getBaseClaimLifecycle || getBaseClaimLifecycle)(searchId);
+  // Calendar-based ages and deadlines still update on every request.
+  return attachClaimVitals(lifecycle);
+}
+
+export async function getClaimLifecycle(searchId, options = {}) {
+  const lifecycle = await (options.getBaseClaimLifecycle || getBaseClaimLifecycle)(searchId);
   const [commentEnriched, categorizationEnriched] = await Promise.all([
-    enrichClaimWithComments(lifecycle),
-    enrichClaimWithCategorization(lifecycle),
+    // Salesforce is intentionally queried on every request. Gemini's immutable
+    // per-comment classifications retain their own content-addressed cache.
+    (options.enrichClaimWithComments || enrichClaimWithComments)(lifecycle),
+    categorizedClaimLifecycle(lifecycle, options),
   ]);
-  return attachClaimCategorization(commentEnriched, {
+  const enriched = attachClaimCategorization(commentEnriched, {
     claim: categorizationEnriched.categorization,
     integration: categorizationEnriched.categorizationIntegration,
   });
+  return attachClaimVitals(enriched);
 }

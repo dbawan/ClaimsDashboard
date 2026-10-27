@@ -1,3 +1,15 @@
+// The selected stream drives every total and CPT series; receipt-only claims
+// must never fall back to ERA amounts in the posted view.
+export function paymentViewData(data, paymentView = "posted") {
+  return {
+    ...data, paymentView,
+    summary: { ...data.summary, totalPaid: paymentView === "received" ? data.summary.receivedPaid : data.summary.totalPaid },
+    timeline: (data.timeline || []).map((event) => paymentView === "received" ? {
+      ...event, countedPayment: event.receivedPayment || 0, cptPayments: event.cptReceived || [],
+    } : event),
+  };
+}
+
 function dateOnly(value) {
   const candidate = String(value ?? "").slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(candidate) ? candidate : null;
@@ -66,7 +78,7 @@ function primaryKind(events) {
   return "lifecycle";
 }
 
-function majorEventMarkers(group, cptDelta) {
+function majorEventMarkers(group, cptDelta, paymentView = "posted") {
   const events = group?.events || [];
   const markers = [];
   const rebillEvents = events.filter((event) => {
@@ -89,7 +101,7 @@ function majorEventMarkers(group, cptDelta) {
   if (Math.abs(cptDelta) >= 0.005) {
     markers.push({
       kind: "payment",
-      label: cptDelta < 0 ? "CPT payment recouped" : "CPT payment received",
+      label: cptDelta < 0 ? "CPT payment reversed" : paymentView === "received" ? "CPT payment received" : "CPT posted payment",
     });
   }
   if (denialEvents.length) {
@@ -196,7 +208,7 @@ export function buildCptPaymentModels(data, eventGroups = buildPaymentChartModel
     const recordTotals = new Map();
 
     for (const line of era.serviceLines || []) {
-      const procedure = String(line.procedure || "Uncoded").trim().toUpperCase() || "Uncoded";
+      const procedure = String(line.procedure || "UNALLOCATED").trim().toUpperCase() || "UNALLOCATED";
       const procedureModel = ensureProcedure(procedure);
       procedureModel.charge = Math.max(
         procedureModel.charge,
@@ -206,7 +218,7 @@ export function buildCptPaymentModels(data, eventGroups = buildPaymentChartModel
       if (!recordTotals.has(procedure)) recordTotals.set(procedure, { charged: 0, paid: 0 });
       const totals = recordTotals.get(procedure);
       totals.charged += numberValue(line.billed);
-      if (!timelineCptPayments.length) totals.paid += numberValue(line.paid);
+      if (data.paymentView === "received" && !timelineCptPayments.length) totals.paid += numberValue(line.paid);
     }
 
     for (const [procedure, totals] of recordTotals) {
@@ -231,7 +243,7 @@ export function buildCptPaymentModels(data, eventGroups = buildPaymentChartModel
           delta,
           cumulative,
           labels: group.labels || [],
-          markers: majorEventMarkers(group, delta),
+          markers: majorEventMarkers(group, delta, data.paymentView),
         };
       });
       return {
@@ -274,7 +286,7 @@ export function buildAggregateCptPaymentModel(models) {
     if (Math.abs(delta) >= 0.005) {
       markers.push({
         kind: "payment",
-        label: delta < 0 ? "Payment recouped across all CPTs" : "Payment received across all CPTs",
+        label: delta < 0 ? "Payment reversed across all CPTs" : models[0]?.paymentView === "received" ? "Payment received across all CPTs" : "Posted payment across all CPTs",
       });
     }
     if (markersByKind.has("denial")) {

@@ -47,3 +47,36 @@ test("TTL cache does not retain failed loads", async () => {
   assert.equal(await cache.getOrLoad("queue", load), "recovered");
   assert.equal(loadCount, 2);
 });
+
+test("cache capacity evicts least recently used entries without extending expiry", async () => {
+  let time = 0;
+  let loads = 0;
+  const cache = createTtlCache({ ttlMs: 100, maxEntries: 2, now: () => time });
+  const load = () => ++loads;
+  assert.equal(await cache.getOrLoad("a", load), 1);
+  await cache.getOrLoad("b", load);
+  time = 90;
+  assert.equal(await cache.getOrLoad("a", load), 1);
+  await cache.getOrLoad("c", load);
+  assert.equal(await cache.getOrLoad("b", load), 4);
+  time = 100;
+  assert.equal(await cache.getOrLoad("c", load), 3);
+  assert.equal(await cache.getOrLoad("a", load), 5);
+});
+
+test("clearing a cache prevents in-flight loads from repopulating it", async () => {
+  const cache = createTtlCache({ ttlMs: 100 });
+  let finishOld;
+  let finishNew;
+  const old = cache.getOrLoad("claim", () => new Promise((resolve) => { finishOld = resolve; }));
+  await Promise.resolve();
+  cache.clear();
+  const fresh = cache.getOrLoad("claim", () => new Promise((resolve) => { finishNew = resolve; }));
+  await Promise.resolve();
+  finishOld("old");
+  assert.equal(await old, "old");
+  const joined = cache.getOrLoad("claim", () => { throw new Error("should share fresh load"); });
+  finishNew("fresh");
+  assert.deepEqual(await Promise.all([fresh, joined]), ["fresh", "fresh"]);
+  assert.equal(await cache.getOrLoad("claim", () => "unexpected"), "fresh");
+});

@@ -427,6 +427,18 @@ button:disabled {
     height: 25px;
   }
 
+  .header-inner-claims .wordmark {
+    display: none;
+  }
+
+  .header-inner-claims .desktop-nav {
+    margin-left: 0;
+  }
+
+  .header-inner-claims .nav-tab-active {
+    display: none;
+  }
+
   .read-only-indicator {
     font-size: 6px;
   }

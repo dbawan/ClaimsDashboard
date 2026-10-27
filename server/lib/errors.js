@@ -26,3 +26,23 @@ export class DatabaseQueryTimeoutError extends Error {
     this.queryLabel = queryLabel || "unlabeled";
   }
 }
+
+export class PatientIdentityUnavailableError extends Error {
+  constructor() {
+    super("This claim does not include enough patient identity data for a patient-scoped claim lookup.");
+    this.name = "PatientIdentityUnavailableError";
+    this.statusCode = 422;
+    this.code = "PATIENT_IDENTITY_UNAVAILABLE";
+    this.expose = true;
+  }
+}
+
+export class PatientNotFoundError extends Error {
+  constructor() {
+    super("The selected patient could not be found.");
+    this.name = "PatientNotFoundError";
+    this.statusCode = 404;
+    this.code = "PATIENT_NOT_FOUND";
+    this.expose = true;
+  }
+}

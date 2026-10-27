@@ -1,11 +1,18 @@
+import { advancedMdEraRows, distinctEraRows } from "../lib/eraReconciliation.js";
 import { withReadOnlySession } from "../db/readOnlyPool.js";
+import { config } from "../config.js";
 import {
+  readClaimIcu,
   readClaimsWithoutResponse,
   readHighLevelDashboard,
   readHighLevelClaims,
   readUnsubmittedAppointments,
 } from "../repositories/highLevelRepository.js";
+import { listClaimWorklistOwners } from "../repositories/worklistRepository.js";
 import { createTtlCache } from "../lib/ttlCache.js";
+import { DATA_CACHE_TTL_MS } from "../lib/dataCache.js";
+import { claimPaymentTiming } from "../lib/claimPaymentTiming.js";
+import { calculateExpectedReimbursement } from "./expectedReimbursementService.js";
 import {
   encounterCandidateFromEraReference,
   normalizeDate,
@@ -18,11 +25,13 @@ const ALLOWED_LIMITS = new Set([10, 25, 50, 100]);
 const ALLOWED_SORTS = new Set(["paid-percent", "youngest", "oldest", "billed"]);
 const ALLOWED_QUEUE_ORDERS = new Set(["youngest", "oldest"]);
 const ALLOWED_DASHBOARD_BILLING_MODES = new Set(["all", "latest", "original"]);
-export const MYSQL_HIGH_LEVEL_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
+const ALLOWED_ICU_SORTS = new Set(["deadline", "cpt-charged", "charged"]);
+export const MYSQL_HIGH_LEVEL_CACHE_TTL_MS = DATA_CACHE_TTL_MS;
 const highLevelClaimsCache = createTtlCache({ ttlMs: MYSQL_HIGH_LEVEL_CACHE_TTL_MS });
 const unsubmittedCache = createTtlCache({ ttlMs: MYSQL_HIGH_LEVEL_CACHE_TTL_MS });
 const noResponseCache = createTtlCache({ ttlMs: MYSQL_HIGH_LEVEL_CACHE_TTL_MS });
 const dashboardCache = createTtlCache({ ttlMs: MYSQL_HIGH_LEVEL_CACHE_TTL_MS });
+const claimIcuCache = createTtlCache({ ttlMs: MYSQL_HIGH_LEVEL_CACHE_TTL_MS });
 
 function cacheLogger(scope) {
   return (stage, details) => console.info(`[mysql-cache:${scope}] ${stage}`, details);
@@ -51,6 +60,16 @@ function dashboardPayerSelection(value) {
   return payers;
 }
 
+export function highLevelProcedureQuery(value) {
+  if (value == null) return "";
+  if (typeof value !== "string") throw inputError("Enter one CPT or HCPCS search value.");
+  const query = value.trim().toUpperCase();
+  if (query && !/^[A-Z0-9.-]{1,20}$/.test(query)) {
+    throw inputError("Use up to 20 letters, numbers, periods, or hyphens for the CPT / HCPCS search.");
+  }
+  return query;
+}
+
 function elapsedDays(date, today) {
   if (!date) return 0;
   return Math.max(0, Math.floor((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${date}T00:00:00Z`)) / 86_400_000));
@@ -58,6 +77,26 @@ function elapsedDays(date, today) {
 
 function todayDate() {
   return new Date().toISOString().slice(0, 10);
+}
+
+function calendarDaysBetween(start, end) {
+  if (!start || !end) return null;
+  const startTime = Date.parse(`${start}T00:00:00Z`);
+  const endTime = Date.parse(`${end}T00:00:00Z`);
+  if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) return null;
+  return Math.round((endTime - startTime) / 86_400_000);
+}
+
+function queryBoolean(value, fallback = false) {
+  if (value == null || value === "") return fallback;
+  if (typeof value !== "string") throw inputError("Choose whether to include past filing limits.");
+  if (["true", "1"].includes(value.toLowerCase())) return true;
+  if (["false", "0"].includes(value.toLowerCase())) return false;
+  throw inputError("Choose whether to include past filing limits.");
+}
+
+function roundedMoney(value) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
 function numberValue(value) {
@@ -96,6 +135,8 @@ function normalizeDashboardEraRow(row, source, sourceRank) {
   return {
     source,
     sourceRank,
+    rowId: row.rowId,
+    payerClaimControl: row.payerClaimControl,
     reference: normalizeIdentifier(row.reference),
     date: normalizeDate(row.eventDate),
     serviceDate: normalizeDate(row.serviceDate),
@@ -112,47 +153,24 @@ function normalizeDashboardEraRow(row, source, sourceRank) {
   };
 }
 
-function dashboardEraSignature(row) {
-  return [
-    row.source,
-    row.reference,
-    row.date,
-    row.serviceDate,
-    row.procedure,
-    row.modifier,
-    row.lineNumber,
-    row.charge,
-    row.paid,
-    row.allowed,
-    row.reasons.join(","),
-    row.payer,
-    row.traceNumber,
-  ].join("|");
+function distinctDashboardEraRows(rows) {
+  return distinctEraRows(rows.map((row, index) => ({
+    ...row, sourceType: row.sourceType || row.source, rowId: row.rowId || String(index),
+    claimReference: row.reference, eventDate: row.date, remitId: row.traceNumber,
+    paidCents: Math.round(row.paid * 100), chargeCents: Math.round(row.charge * 100),
+    allowedCents: Math.round(row.allowed * 100), adjustment: row.reasons.join(","), units: "",
+  }))).rows;
 }
 
-function distinctDashboardEraRows(rows) {
-  const seenWithinSource = new Set();
-  const result = [];
-
-  for (const row of [...rows].sort((left, right) => left.sourceRank - right.sourceRank)) {
-    const signature = dashboardEraSignature(row);
-    if (seenWithinSource.has(signature)) continue;
-    seenWithinSource.add(signature);
-
-    const duplicate = result.some((other) => {
-      if (other.source === row.source || other.paid !== row.paid) return false;
-      if (other.procedure !== row.procedure) return false;
-      if (other.serviceDate && row.serviceDate && other.serviceDate !== row.serviceDate) return false;
-      const sameTrace = Boolean(other.traceNumber && row.traceNumber && other.traceNumber === row.traceNumber);
-      const sameReference = Boolean(other.reference && row.reference && other.reference === row.reference);
-      const sameDateAndReason = other.date === row.date
-        && other.payer === row.payer
-        && other.reasons.join(",") === row.reasons.join(",");
-      return sameTrace || (sameReference && sameDateAndReason);
-    });
-    if (!duplicate) result.push(row);
-  }
-  return result;
+function advancedMdDashboardRows(rows) {
+  return advancedMdEraRows(rows).map((row) => ({
+    ...row, source: "advancedmd", reference: normalizeIdentifier(row.claimReference),
+    date: normalizeDate(row.eventDate), procedure: row.procedure || "UNCODED",
+    charge: (row.chargeCents || 0) / 100, paid: row.paidCents / 100,
+    allowed: (row.allowedCents || 0) / 100,
+    reasons: row.claimLevelOnly ? [] : denialReasons(row.adjustment),
+    payerLabel: row.payer, payer: normalizeIdentifier(row.payer), traceNumber: normalizeIdentifier(row.remitId),
+  }));
 }
 
 function netDashboardPaymentGroups(rows) {
@@ -315,7 +333,11 @@ export function buildHighLevelDashboardResponse(result, {
   end,
   billingMode = "all",
   payers = [],
+  procedureQuery = "",
 }) {
+  const normalizedProcedureQuery = highLevelProcedureQuery(procedureQuery);
+  const includesProcedure = (row) => !normalizedProcedureQuery
+    || row.procedure.includes(normalizedProcedureQuery);
   const daily = new Map();
   const startTime = Date.parse(`${start}T00:00:00Z`);
   const endTime = Date.parse(`${end}T00:00:00Z`);
@@ -326,6 +348,8 @@ export function buildHighLevelDashboardResponse(result, {
       billed: 0,
       paid: 0,
       recouped: 0,
+      posted: 0,
+      postedClaimMap: new Map(),
       claimCount: 0,
       paymentLineCount: 0,
       deniedLineCount: 0,
@@ -338,10 +362,13 @@ export function buildHighLevelDashboardResponse(result, {
 
   const billedRows = dashboardBilledRowsForMode(result, billingMode);
   const allEraRows = distinctDashboardEraRows([
-    ...(result.claimStatusRows || []).map((row) => normalizeDashboardEraRow(row, "claim-status", 0)),
-    ...(result.ediRows || []).map((row) => normalizeDashboardEraRow(row, "edi-835", 1)),
+    ...advancedMdDashboardRows(result.advancedMdEra),
+    ...(result.claimStatusRows || []).map((row) => normalizeDashboardEraRow(row, "claim-status", 1)),
+    ...(result.ediRows || []).map((row) => normalizeDashboardEraRow(row, "edi-835", 2)),
   ]).filter((row) => row.date && daily.has(row.date));
-  const payerContext = dashboardPayerContext(billedRows, allEraRows);
+  const allPostedRows = (result.postedRows || []).map((row) => normalizeDashboardEraRow(row, "posted", 3))
+    .filter((row) => row.date && daily.has(row.date));
+  const payerContext = dashboardPayerContext(billedRows, [...allEraRows, ...allPostedRows]);
   const payerOptions = payerContext.options;
   const selectedPayers = [...new Set(
     payers.map(dashboardPayerKey).filter((payer) => payerOptions.some((option) => option.key === payer)),
@@ -350,7 +377,7 @@ export function buildHighLevelDashboardResponse(result, {
   const includesBilledPayer = (payer) => !payerFilter.size || payerFilter.has(dashboardPayerKey(payer));
   const includesEraPayer = (row) => !payerFilter.size || payerFilter.has(payerContext.eraPayerKey(row));
 
-  for (const row of billedRows.filter((row) => includesBilledPayer(row.payer))) {
+  for (const row of billedRows.filter((row) => includesBilledPayer(row.payer) && includesProcedure(row))) {
     if (!row.date || !daily.has(row.date)) continue;
     const point = daily.get(row.date);
     point.billed = Number((point.billed + row.charge).toFixed(2));
@@ -375,7 +402,7 @@ export function buildHighLevelDashboardResponse(result, {
     point.claimMap.set(claimKey, claim);
   }
 
-  const eraRows = allEraRows.filter(includesEraPayer);
+  const eraRows = allEraRows.filter((row) => includesEraPayer(row) && includesProcedure(row));
   const deniedCptStats = new Map();
   const denialReasonStats = new Map();
   const latestDeniedBilled = latestDeniedBilledLookup(result.latestDeniedBilledRows);
@@ -450,11 +477,26 @@ export function buildHighLevelDashboardResponse(result, {
     }
   }
 
+  for (const payment of netDashboardPaymentGroups(allPostedRows.filter((row) => includesEraPayer(row) && includesProcedure(row)))) {
+    const point = daily.get(payment.date);
+    point.posted = Number((point.posted + payment.paid).toFixed(2));
+    const key = payment.reference || "UNKNOWN";
+    const claim = point.postedClaimMap.get(key) || {
+      claimId: key, payer: payment.payer, serviceDate: payment.serviceDate, posted: 0, procedures: new Set(),
+    };
+    claim.posted = Number((claim.posted + payment.paid).toFixed(2));
+    for (const procedure of payment.procedures) claim.procedures.add(procedure);
+    point.postedClaimMap.set(key, claim);
+  }
+
   const dailyPoints = [...daily.values()].map((point) => ({
     date: point.date,
     billed: point.billed,
     paid: point.paid,
     recouped: point.recouped,
+    posted: point.posted,
+    postedClaims: [...point.postedClaimMap.values()].map((claim) => ({ ...claim, procedures: [...claim.procedures].sort() }))
+      .sort((a, b) => b.posted - a.posted || a.claimId.localeCompare(b.claimId)),
     claimCount: point.claimMap.size,
     paymentLineCount: point.paymentLineCount,
     deniedLineCount: point.deniedLineCount,
@@ -505,11 +547,13 @@ export function buildHighLevelDashboardResponse(result, {
     start,
     end,
     billingMode,
+    procedureQuery: normalizedProcedureQuery,
     payerOptions,
     selectedPayers,
     totals: {
       billed: Number(dailyPoints.reduce((total, point) => total + point.billed, 0).toFixed(2)),
       paid: Number(dailyPoints.reduce((total, point) => total + point.paid, 0).toFixed(2)),
+      posted: Number(dailyPoints.reduce((total, point) => total + point.posted, 0).toFixed(2)),
       recouped: Number(dailyPoints.reduce((total, point) => total + point.recouped, 0).toFixed(2)),
       claimsBilled: dailyPoints.reduce((total, point) => total + point.claimCount, 0),
       deniedLines: [...deniedCptStats.values()].reduce((total, stats) => total + stats.count, 0),
@@ -539,6 +583,8 @@ function currentStatus(events) {
     if (event.status === "submitted") return "pending";
     if (event.status === "reversed" || event.status === "action") return "action";
     if (event.status === "paid") return "paid";
+    if (event.status === "received") return status === "paid" ? "paid" : "received";
+    if (event.status === "receipt-reversed") return "action";
     if (event.status === "processed") return status === "paid" ? "paid" : "action";
     if (event.status === "created" && status === "created") return "created";
     return status;
@@ -557,26 +603,273 @@ const EVENT_PRIORITY = Object.freeze({
   activity: 1,
   submitted: 2,
   action: 3,
+  received: 3,
+  "receipt-reversed": 5,
   paid: 4,
   reversed: 5,
   processed: 6,
 });
 
-export function buildHighLevelResponse(result, { start, end, limit, sort = "youngest" }) {
-  const eventsByClaim = new Map();
-  for (const event of result.events) {
-    if (!eventsByClaim.has(event.claimId)) eventsByClaim.set(event.claimId, []);
-    eventsByClaim.get(event.claimId).push(event);
+function highLevelPaymentEvents(events) {
+  const payments = events.filter((event) => (
+    (event.status === "paid" || event.status === "reversed")
+    && Number.isFinite(Number(event.amount))
+    && Number(event.amount) !== 0
+  ));
+  return payments.filter((event) => event.source === "billing").map((event) => ({
+    date: event.date, amount: Number(event.amount),
+  }));
+}
+
+function claimCreationDate(claim, events) {
+  const created = events
+    .filter((event) => event.status === "created" && event.date)
+    .map((event) => event.date)
+    .sort()[0];
+  if (created) return created;
+  return [
+    ...events.filter((event) => event.source === "billing").map((event) => event.date),
+    claim.firstActivity,
+    claim.serviceDate,
+  ].filter(Boolean).sort()[0] || null;
+}
+
+function cptPaymentSummary(latestCharges, events) {
+  const procedures = new Map();
+  function getProcedure(code) {
+    const procedure = normalizeIdentifier(code) || "UNCODED";
+    if (!procedures.has(procedure)) {
+      procedures.set(procedure, { procedure, latestCharge: null, postedCents: 0, receivedCents: 0 });
+    }
+    return procedures.get(procedure);
+  }
+  for (const charge of latestCharges || []) {
+    const row = getProcedure(charge.procedure);
+    row.latestCharge = Number(((row.latestCharge || 0) + numberValue(charge.latestCharge)).toFixed(2));
+  }
+  for (const event of events) {
+    const posted = event.source === "billing" && ["paid", "reversed"].includes(event.status);
+    const received = event.source === "payer";
+    if ((!posted && !received) || !numberValue(event.amount)) continue;
+    const row = getProcedure(event.procedure);
+    row[posted ? "postedCents" : "receivedCents"] += Math.round(numberValue(event.amount) * 100);
+  }
+  return [...procedures.values()].map(({ postedCents, receivedCents, ...row }) => ({
+    ...row, posted: postedCents / 100, received: receivedCents / 100,
+  })).sort((a, b) => (b.latestCharge || 0) - (a.latestCharge || 0) || a.procedure.localeCompare(b.procedure));
+}
+
+export function buildHighLevelResponse(result, {
+  start,
+  end,
+  limit,
+  page = 1,
+  sort = "youngest",
+  paidThresholdPercent = config.claims.paidThresholdPercent,
+  procedureQuery = "",
+}) {
+  const lifecycleEventsByClaim = new Map();
+  for (const event of result.lifecycleEvents || result.events) {
+    if (!lifecycleEventsByClaim.has(event.claimId)) lifecycleEventsByClaim.set(event.claimId, []);
+    lifecycleEventsByClaim.get(event.claimId).push(event);
   }
   const claims = result.claims.map((claim) => {
-    const events = (eventsByClaim.get(claim.claimId) || [])
+    const lifecycleEvents = (lifecycleEventsByClaim.get(claim.claimId) || [])
       .sort((left, right) => left.date.localeCompare(right.date)
         || (EVENT_PRIORITY[left.status] ?? 99) - (EVENT_PRIORITY[right.status] ?? 99)
         || left.label.localeCompare(right.label));
+    const events = lifecycleEvents.filter((event) => event.date >= start && event.date <= end);
     const status = currentStatus(events);
-    return { ...claim, currentStatus: status, issueLabel: currentIssue(events, status), events };
+    const paymentTiming = claimPaymentTiming({
+      createdAt: claimCreationDate(claim, lifecycleEvents),
+      latestCharge: claim.latestChargeAmount,
+      payments: highLevelPaymentEvents(lifecycleEvents),
+      thresholdPercent: paidThresholdPercent,
+    });
+    const posted = Number(highLevelPaymentEvents(lifecycleEvents).reduce((total, event) => total + event.amount, 0).toFixed(2));
+    const received = Number(lifecycleEvents.filter((event) => event.source === "payer").reduce((total, event) => total + numberValue(event.amount), 0).toFixed(2));
+    return {
+      ...claim,
+      paidAmount: posted,
+      receivedAmount: received,
+      paidPercent: claim.billedAmount > 0 ? posted / claim.billedAmount : 0,
+      cptPayments: cptPaymentSummary(claim.latestChargeByCpt, lifecycleEvents),
+      ...paymentTiming,
+      currentStatus: status,
+      issueLabel: currentIssue(events, status),
+      events,
+    };
   });
-  return { start, end, limit, sort, total: result.total, claims };
+  const totalPages = Math.max(1, Math.ceil(result.total / limit));
+  return {
+    start,
+    end,
+    limit,
+    page,
+    offset: (page - 1) * limit,
+    totalPages,
+    sort,
+    procedureQuery,
+    paidThresholdPercent,
+    total: result.total,
+    claims,
+  };
+}
+
+export function buildClaimIcuResponse(result, {
+  today = todayDate(),
+  limit = 25,
+  page = 1,
+  sort = "deadline",
+  includePastDeadline = false,
+  procedureQuery = "",
+  owners = [],
+  ownerStatus = "ready",
+  calculateExpected = calculateExpectedReimbursement,
+} = {}) {
+  const ownerByClaim = new Map();
+  for (const owner of owners) {
+    const key = normalizeIdentifier(owner.claimId);
+    if (!key) continue;
+    const current = ownerByClaim.get(key);
+    if (!current) {
+      ownerByClaim.set(key, {
+        ...owner,
+        worklistTypes: owner.worklistType ? [owner.worklistType] : [],
+        worklistCount: 1,
+      });
+      continue;
+    }
+    const worklistTypes = [...new Set([
+      ...current.worklistTypes,
+      ...(owner.worklistType ? [owner.worklistType] : []),
+    ])];
+    ownerByClaim.set(key, {
+      ...current,
+      ownerId: current.ownerId === owner.ownerId ? current.ownerId : null,
+      ownerName: current.ownerName === owner.ownerName ? current.ownerName : "Multiple owners",
+      worklistType: worklistTypes.join(", ") || null,
+      worklistTypes,
+      worklistCount: current.worklistCount + 1,
+    });
+  }
+  const claims = result.claims.map((claim) => {
+    const expected = calculateExpected({
+      payerNames: [claim.payer],
+      cptFinancials: claim.cptFinancials,
+    });
+    const expectedRemaining = expected.total == null
+      ? null
+      : Math.max(0, expected.total - numberValue(claim.paidAmount));
+    const recoveryAmount = expectedRemaining == null
+      ? null
+      : roundedMoney(Math.min(Math.max(0, numberValue(claim.outstandingArAmount)), expectedRemaining));
+    const assignment = ownerByClaim.get(normalizeIdentifier(claim.claimId));
+    const cptDetails = claim.cptFinancials.map((line, index) => {
+      const reimbursement = expected.breakdown?.[index] || {};
+      const postedAmount = roundedMoney(numberValue(line.postedAmount));
+      const cptOutstandingArAmount = roundedMoney(numberValue(line.outstandingArAmount));
+      const cptExpectedRemaining = reimbursement.expected == null
+        ? null
+        : Math.max(0, reimbursement.expected - postedAmount);
+      const cptRecoveryAmount = cptExpectedRemaining == null
+        ? null
+        : roundedMoney(Math.min(Math.max(0, cptOutstandingArAmount), cptExpectedRemaining));
+      return Object.freeze({
+        procedure: line.procedure,
+        units: line.units,
+        chargedAmount: roundedMoney(numberValue(line.charged)),
+        postedAmount,
+        outstandingArAmount: cptOutstandingArAmount,
+        expectedReimbursement: reimbursement.expected ?? null,
+        ratePerUnit: reimbursement.ratePerUnit ?? null,
+        recoveryAmount: cptRecoveryAmount,
+      });
+    });
+    return {
+      ...claim,
+      ageDays: claim.serviceDate ? elapsedDays(claim.serviceDate, today) : null,
+      daysToDeadline: calendarDaysBetween(today, claim.deadlineDate),
+      expectedReimbursement: expected.total,
+      expectedReimbursementComplete: expected.complete,
+      recoveryAmount,
+      cptDetails,
+      ownerAssigned: Boolean(assignment),
+      owner: assignment ? {
+        id: assignment.ownerId || null,
+        name: assignment.ownerName || null,
+        worklistType: assignment.worklistType || null,
+        worklistCount: assignment.worklistCount || 1,
+      } : null,
+    };
+  });
+  return {
+    today,
+    limit,
+    page,
+    offset: (page - 1) * limit,
+    total: result.total,
+    totalPages: Math.max(1, Math.ceil(result.total / limit)),
+    sort,
+    includePastDeadline,
+    procedureQuery,
+    ownerStatus,
+    claims,
+  };
+}
+
+export async function getClaimIcu(query = {}, options = {}) {
+  const limit = Number(query.limit || 25);
+  if (!ALLOWED_LIMITS.has(limit)) throw inputError("Rows must be 10, 25, 50, or 100.");
+  const page = Number(query.page || 1);
+  if (!Number.isSafeInteger(page) || page < 1 || page > 100_000) {
+    throw inputError("Page must be a whole number from 1 to 100,000.");
+  }
+  const sort = String(query.sort || "deadline");
+  if (!ALLOWED_ICU_SORTS.has(sort)) throw inputError("Choose a valid Claim ICU priority.");
+  const includePastDeadline = queryBoolean(query.includePastDeadline);
+  const procedureQuery = highLevelProcedureQuery(query.procedureQuery);
+  const offset = (page - 1) * limit;
+  const cache = options.cache || claimIcuCache;
+  const runReadOnly = options.withReadOnlySession || withReadOnlySession;
+  const readIcu = options.readClaimIcu || readClaimIcu;
+  const cacheKey = `${limit}:${page}:${sort}:${includePastDeadline}:${procedureQuery}`;
+  const result = await cache.getOrLoad(
+    cacheKey,
+    () => runReadOnly((session) => readIcu(session, {
+      limit,
+      offset,
+      sort,
+      includePastDeadline,
+      procedureQuery,
+    })),
+    cacheLogger("claim-icu"),
+  );
+
+  let owners = [];
+  let ownerStatus = "ready";
+  try {
+    const readOwners = options.listClaimWorklistOwners || listClaimWorklistOwners;
+    owners = await readOwners(result.claims.map(({ claimId }) => claimId), options.repositoryOptions);
+  } catch (error) {
+    ownerStatus = "unavailable";
+    console.error("[claim-icu:owners] lookup failed", {
+      code: error?.code || error?.databaseCode || null,
+      name: error?.name || "Error",
+    });
+  }
+
+  return buildClaimIcuResponse(result, {
+    today: (options.today || todayDate)(),
+    limit,
+    page,
+    sort,
+    includePastDeadline,
+    procedureQuery,
+    owners,
+    ownerStatus,
+    calculateExpected: options.calculateExpected || calculateExpectedReimbursement,
+  });
 }
 
 export async function getHighLevelDashboard(query) {
@@ -588,13 +881,14 @@ export async function getHighLevelDashboard(query) {
   const billingMode = String(query.billingMode || "all");
   if (!ALLOWED_DASHBOARD_BILLING_MODES.has(billingMode)) throw inputError("Choose a valid dashboard billing mode.");
   const payers = dashboardPayerSelection(query.payer);
+  const procedureQuery = highLevelProcedureQuery(query.procedureQuery);
   const cacheKey = `${start}:${end}`;
   const result = await dashboardCache.getOrLoad(
     cacheKey,
     () => withReadOnlySession((session) => readHighLevelDashboard(session, { start, end })),
     cacheLogger("dashboard"),
   );
-  return buildHighLevelDashboardResponse(result, { start, end, billingMode, payers });
+  return buildHighLevelDashboardResponse(result, { start, end, billingMode, payers, procedureQuery });
 }
 
 export async function getHighLevelClaims(query) {
@@ -603,20 +897,28 @@ export async function getHighLevelClaims(query) {
   if (start > end) throw inputError("Start date must be on or before end date.");
   const limit = Number(query.limit || 25);
   if (!ALLOWED_LIMITS.has(limit)) throw inputError("Rows must be 10, 25, 50, or 100.");
+  const page = Number(query.page || 1);
+  if (!Number.isSafeInteger(page) || page < 1 || page > 100_000) {
+    throw inputError("Page must be a whole number from 1 to 100,000.");
+  }
+  const offset = (page - 1) * limit;
   const sort = String(query.sort || "youngest");
   if (!ALLOWED_SORTS.has(sort)) throw inputError("Choose a valid claim sort.");
-  const cacheKey = `${start}:${end}:${limit}:${sort}`;
+  const procedureQuery = highLevelProcedureQuery(query.procedureQuery);
+  const cacheKey = `${start}:${end}:${limit}:${page}:${sort}:${procedureQuery}`;
   const result = await highLevelClaimsCache.getOrLoad(
     cacheKey,
     () => withReadOnlySession((session) => readHighLevelClaims(session, {
       start,
       end,
       limit,
+      offset,
       sort,
+      procedureQuery,
     })),
     cacheLogger("high-level-claims"),
   );
-  return buildHighLevelResponse(result, { start, end, limit, sort });
+  return buildHighLevelResponse(result, { start, end, limit, page, sort, procedureQuery });
 }
 
 export function buildAgingResponse(result, mode, today = todayDate(), options = {}) {

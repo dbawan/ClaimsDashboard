@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildClaimStory, plainSourceLabel } from "./claimStoryModel.js";
+import {
+  buildClaimStory,
+  plainSourceLabel,
+  scopeClaimDataToProcedure,
+} from "./claimStoryModel.js";
 
 let eventNumber = 0;
 
@@ -106,4 +110,65 @@ test("technical source names are replaced with plain labels", () => {
   assert.equal(plainSourceLabel("ClaimStatus ERA"), "Payer remittance");
   assert.equal(plainSourceLabel("Salesforce comment + Gemini"), "Team note");
   assert.equal(plainSourceLabel("Combined sources"), "Reconciled records");
+});
+
+test("a selected CPT story excludes other lines and keeps received and posted money separate", () => {
+  const data = {
+    claim: { claimId: "82020" },
+    summary: { charges: 1_500, totalPaid: 650, receivedPaid: 650 },
+    cptFinancials: [
+      { procedure: "A9596", charged: 577.5 },
+      { procedure: "J7999", charged: 922.5 },
+    ],
+    timeline: [
+      event("2026-07-28", "Date of service", { source: "Combined sources" }),
+      event("2026-08-03", "Claim created", {
+        procedures: ["A9596", "J7999"],
+        cptActivity: [{ procedure: "A9596", lineCount: 1, posted: 0, received: 0 }],
+      }),
+      event("2026-08-21", "Claim adjudicated", {
+        amount: 650,
+        paymentAuthority: "era",
+        procedures: ["A9596", "J7999"],
+        cptActivity: [{
+          procedure: "A9596",
+          lineCount: 1,
+          billed: 577.5,
+          allowed: 0,
+          posted: 0,
+          received: 0,
+          adjustments: ["CO252: Documentation required"],
+        }],
+      }),
+      event("2026-08-26", "Posted payment", {
+        amount: 650,
+        countedPayment: 650,
+        paymentAuthority: "posted",
+        procedures: ["A9596", "J7999"],
+        cptActivity: [{ procedure: "A9596", lineCount: 1, posted: 50, received: 0 }],
+      }),
+      event("2026-08-26", "Posted payment", {
+        amount: 600,
+        countedPayment: 600,
+        paymentAuthority: "posted",
+        procedures: ["J7999"],
+        cptActivity: [{ procedure: "J7999", lineCount: 1, posted: 600, received: 0 }],
+      }),
+    ],
+  };
+
+  const scoped = scopeClaimDataToProcedure(data, "A9596");
+  assert.equal(scoped.procedureScope.relevantRecordCount, 3);
+  assert.equal(scoped.procedureScope.contextCount, 1);
+  assert.equal(scoped.summary.charges, 577.5);
+  assert.equal(scoped.summary.totalPaid, 50);
+  assert.equal(scoped.summary.receivedPaid, 0);
+  assert.equal(scoped.timeline.some((item) => item.procedures?.includes("J7999") && !item.procedures.includes("A9596")), false);
+  assert.match(scoped.timeline.find((item) => item.paymentAuthority === "era").description, /Billed \$577\.50/);
+  assert.match(scoped.timeline.find((item) => item.paymentAuthority === "era").description, /CO252/);
+  assert.match(scoped.timeline.find((item) => item.paymentAuthority === "posted").description, /Posted \$50\.00/);
+
+  const story = buildClaimStory(scoped, { selectedProcedure: "A9596" });
+  assert.ok(story.some((item) => item.title === "Payer response: no payment — A9596"));
+  assert.ok(story.some((item) => item.title === "Payment posted internally — A9596" && item.amount === 50));
 });

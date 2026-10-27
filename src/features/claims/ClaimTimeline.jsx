@@ -1,18 +1,27 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { StatusBadge } from "../../components/StatusBadge.jsx";
 import { formatDate, formatMoney } from "./ClaimSummary.jsx";
+import { scopeClaimDataToProcedure } from "./claimStoryModel.js";
 
 function sourceTone(event) {
   if (event.paymentAuthority === "era") return "success";
-  if (event.paymentAuthority === "transaction-fallback") return "warning";
+  if (event.paymentAuthority === "posted") return "warning";
   return "neutral";
 }
 
-export function ClaimTimeline({ data, defaultExpanded = false }) {
+export function ClaimTimeline({ data, selectedProcedure = null, defaultExpanded = false }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
+  const [showAllRecords, setShowAllRecords] = useState(false);
   const contentId = useId();
+  const scopedData = useMemo(
+    () => selectedProcedure ? scopeClaimDataToProcedure(data, selectedProcedure) : data,
+    [data, selectedProcedure],
+  );
+  const viewData = selectedProcedure && !showAllRecords ? scopedData : data;
+  const isProcedureView = Boolean(selectedProcedure && !showAllRecords);
 
   useEffect(() => setExpanded(defaultExpanded), [data.claim.claimId, defaultExpanded]);
+  useEffect(() => setShowAllRecords(false), [data.claim.claimId, selectedProcedure]);
 
   return (
     <section className="timeline-card" aria-labelledby="timeline-heading">
@@ -24,13 +33,13 @@ export function ClaimTimeline({ data, defaultExpanded = false }) {
         onClick={() => setExpanded((value) => !value)}
       >
         <span className="timeline-toggle-copy">
-          <span className="section-kicker">Source-level history</span>
+          <span className="section-kicker">{isProcedureView ? "CPT-specific source history" : "Source-level history"}</span>
           <span className="timeline-toggle-heading" id="timeline-heading" role="heading" aria-level="2">
-            All claim records
+            {isProcedureView ? `Records relevant to ${selectedProcedure}` : "All claim records"}
           </span>
         </span>
         <span className="timeline-toggle-meta">
-          <span className="timeline-count">{data.timeline.length} records</span>
+          <span className="timeline-count">{viewData.timeline.length} records</span>
           <svg viewBox="0 0 20 20" aria-hidden="true">
             <path d="m5 7.5 5 5 5-5" />
           </svg>
@@ -39,9 +48,22 @@ export function ClaimTimeline({ data, defaultExpanded = false }) {
 
       {expanded ? (
         <div className="timeline-expanded" id={contentId}>
+          {selectedProcedure ? (
+            <div className="timeline-scope-toolbar">
+              <div>
+                <strong>{showAllRecords ? "Showing the complete claim" : `Showing ${selectedProcedure} activity`}</strong>
+                <span>{showAllRecords
+                  ? `${data.timeline.length} claim-wide source records`
+                  : `${scopedData.procedureScope.relevantRecordCount} CPT record${scopedData.procedureScope.relevantRecordCount === 1 ? "" : "s"} and ${scopedData.procedureScope.contextCount} context record${scopedData.procedureScope.contextCount === 1 ? "" : "s"}`}</span>
+              </div>
+              <button type="button" onClick={() => setShowAllRecords((value) => !value)}>
+                {showAllRecords ? `Show ${selectedProcedure} only` : `Show all ${data.timeline.length} claim records`}
+              </button>
+            </div>
+          ) : null}
           <ol className="timeline-list">
-            {data.timeline.map((event) => (
-              <li className={`timeline-event timeline-event-${event.status}`} key={event.id}>
+            {viewData.timeline.map((event) => (
+              <li className={`timeline-event timeline-event-${event.status}${event.claimContext ? " timeline-event-context" : ""}`} key={event.id}>
                 <div className="timeline-rail" aria-hidden="true">
                   <span />
                 </div>
@@ -71,24 +93,35 @@ export function ClaimTimeline({ data, defaultExpanded = false }) {
                       {event.commentText}{event.commentTextTruncated ? "…" : ""}
                     </blockquote>
                   ) : null}
-                  <StatusBadge tone={sourceTone(event)}>{event.source}</StatusBadge>
+                  <StatusBadge tone={event.claimContext ? "neutral" : sourceTone(event)}>
+                    {event.claimContext ? "Claim context" : event.source}
+                  </StatusBadge>
                 </div>
               </li>
             ))}
           </ol>
 
-          <div className="timeline-footer">
-            <div>
+          <div className={`timeline-footer${isProcedureView ? " timeline-footer-procedure" : ""}`}>
+            {isProcedureView ? <div>
+              <span>Relevant source records</span>
+              <strong>{scopedData.procedureScope.relevantRecordCount}</strong>
+            </div> : <div>
               <span>Duplicates removed</span>
               <strong>{data.provenance.duplicatesRemoved}</strong>
-            </div>
+            </div>}
             <div>
-              <span>ERA-matched postings</span>
-              <strong>{data.provenance.eraMatchedPostings}</strong>
+              <span>Posted payment</span>
+              <strong>{formatMoney(viewData.summary.totalPaid)}</strong>
             </div>
-            <p>{data.provenance.matchRule}</p>
+            {isProcedureView ? <div>
+              <span>Payment received</span>
+              <strong>{formatMoney(scopedData.summary.receivedPaid)}</strong>
+            </div> : null}
+            <p>{isProcedureView
+              ? `Only events explicitly associated with CPT ${selectedProcedure} are included. Claim-level service date is retained as context.`
+              : data.provenance.matchRule}</p>
           </div>
-          {data.warnings?.length ? (
+          {!isProcedureView && data.warnings?.length ? (
             <div className="reconciliation-notes">
               <h3>Data quality / reconciliation notes</h3>
               <ul>

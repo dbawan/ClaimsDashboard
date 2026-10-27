@@ -1,5 +1,8 @@
 services:
   claim-lifecycle:
+    extends:
+      file: "compose.${APP_ENV:-development}.yaml"
+      service: profile
     build:
       context: .
       dockerfile: Dockerfile
@@ -12,8 +15,6 @@ services:
       NODE_ENV: production
       HOST: 0.0.0.0
       PORT: 3000
-    ports:
-      - "${APP_PORT:-4200}:3000"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m

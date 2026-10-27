@@ -1,6 +1,5 @@
 import { StatusBadge } from "../../components/StatusBadge.jsx";
 import { buildAppealRebillItems } from "./claimActivityModel.js";
-import { buildClaimStory } from "./claimStoryModel.js";
 
 const currency = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -35,21 +34,202 @@ function Detail({ label, value }) {
   );
 }
 
-function SummaryMetric({ label, value, tone }) {
+function daysValue(value) {
+  if (value == null) return "Unavailable";
+  const days = Number(value);
+  return `${days.toLocaleString("en-US")} day${days === 1 ? "" : "s"}`;
+}
+
+function deadlineStatus(daysLeft) {
+  if (daysLeft == null) return { value: "Unavailable", tone: "neutral" };
+  if (daysLeft < 0) {
+    return {
+      value: `${Math.abs(daysLeft).toLocaleString("en-US")}d overdue`,
+      tone: "danger",
+    };
+  }
+  if (daysLeft === 0) return { value: "Due today", tone: "danger" };
+  return {
+    value: `${daysLeft.toLocaleString("en-US")}d left`,
+    tone: daysLeft <= 7 ? "warning" : "neutral",
+  };
+}
+
+function optionalMoney(value) {
+  return value == null ? "Unavailable" : formatMoney(value);
+}
+
+function formatUnits(value) {
+  const units = Number(value);
+  if (!Number.isFinite(units)) return "1 unit";
+  return `${units.toLocaleString("en-US")} unit${units === 1 ? "" : "s"}`;
+}
+
+function ExpectedReimbursementRow({ metric, vitals }) {
+  const breakdown = vitals.expectedReimbursementBreakdown || [];
+  const matched = Number(vitals.expectedReimbursementMatchedCptCount) || 0;
+  const total = Number(vitals.expectedReimbursementTotalCptCount) || breakdown.length;
+
   return (
-    <div className={`summary-cell ${tone ? `summary-${tone}` : ""}`}>
-      <span>{label}</span>
-      <strong title={value}>{value}</strong>
+    <div className="claim-vitals-summary-row claim-vitals-reimbursement-row">
+      <details className="claim-vitals-reimbursement">
+        <summary
+          title={metric.detail}
+          aria-label={`${metric.label}: ${metric.value}. ${metric.detail}. Click for CPT breakdown.`}
+        >
+          <span className="claim-vitals-reimbursement-label">
+            {metric.label}
+            <small>{total ? `${matched}/${total} CPTs matched` : "No CPT codes"}</small>
+          </span>
+          <strong>{metric.value}</strong>
+          <i aria-hidden="true">⌄</i>
+        </summary>
+        <div className="claim-vitals-reimbursement-breakdown">
+          <p>
+            {vitals.expectedReimbursementPayer
+              ? `Rate payer: ${vitals.expectedReimbursementPayer}`
+              : "Payer/CPT reimbursement matrix"}
+          </p>
+          {breakdown.length ? (
+            <ol>
+              {breakdown.map((line) => (
+                <li key={line.procedure}>
+                  <span>
+                    <b>{line.procedure}</b>
+                    <small>
+                      {line.ratePerUnit == null
+                        ? "No payer rate found"
+                        : `${formatUnits(line.units)} × ${formatMoney(line.ratePerUnit)}`}
+                    </small>
+                  </span>
+                  <strong>{optionalMoney(line.expected)}</strong>
+                </li>
+              ))}
+            </ol>
+          ) : <p>No CPT codes are available for this claim.</p>}
+        </div>
+      </details>
     </div>
+  );
+}
+
+function ClaimVitalsSummary({ data, statusTone }) {
+  const vitals = data.claimVitals || {};
+  const filing = deadlineStatus(vitals.filingLimitDaysLeft);
+  const appeal = deadlineStatus(vitals.appealDaysLeft);
+  const claimAge = vitals.claimAgeDays == null ? null : Number(vitals.claimAgeDays);
+  const daysSinceTouch = vitals.daysSinceTouch == null ? null : Number(vitals.daysSinceTouch);
+  const metrics = [
+    {
+      key: "claim-age",
+      label: "Claim Age",
+      value: daysValue(vitals.claimAgeDays),
+      detail: data.claim?.serviceDate ? `Since DOS ${formatDate(data.claim.serviceDate)}` : "Date of service unavailable",
+      tone: claimAge >= 90 ? "danger" : claimAge >= 30 ? "warning" : "neutral",
+    },
+    {
+      key: "days-since-touch",
+      label: "Days Since Touch",
+      value: daysValue(vitals.daysSinceTouch),
+      detail: vitals.lastTouchDate
+        ? `Latest claim transaction or Salesforce comment ${formatDate(vitals.lastTouchDate)}`
+        : "No claim transaction or Salesforce comment date available",
+      tone: daysSinceTouch >= 30 ? "danger" : daysSinceTouch >= 7 ? "warning" : "neutral",
+    },
+    {
+      key: "outstanding-ar",
+      label: "Outstanding AR",
+      value: optionalMoney(vitals.outstandingArAmount),
+      detail: "Total charge − paid − write-offs",
+      tone: Number(vitals.outstandingArAmount) > 0 ? "warning" : "neutral",
+    },
+    {
+      key: "original-charge",
+      label: "Original Charge",
+      value: optionalMoney(vitals.originalCharge),
+      detail: "Original claim-created service lines",
+    },
+    {
+      key: "expected-reimbursement",
+      label: "Expected Reimb.",
+      value: optionalMoney(vitals.expectedReimbursement),
+      detail: vitals.expectedReimbursementTotalCptCount
+        ? `Payer/CPT matrix total · ${vitals.expectedReimbursementMatchedCptCount || 0} of ${vitals.expectedReimbursementTotalCptCount} CPT codes matched`
+        : "No CPT codes available for a payer/CPT matrix lookup",
+      expandable: true,
+    },
+    {
+      key: "paid",
+      label: "Paid",
+      value: optionalMoney(vitals.paid),
+      detail: "Reconciled authoritative payments",
+      tone: vitals.paid == null ? "neutral" : "success",
+    },
+    {
+      key: "attempts",
+      label: "Attempts",
+      value: vitals.attempts == null ? "Unavailable" : Number(vitals.attempts).toLocaleString("en-US"),
+      detail: "Distinct submissions, corrections, and rebills",
+    },
+    {
+      key: "filing-limit",
+      label: "Filing Limit Left",
+      value: filing.value,
+      detail: vitals.filingLimitDate
+        ? `90-day deadline ${formatDate(vitals.filingLimitDate)} · ${vitals.filingStartReason === "appeal_or_rebill" ? "appeal/rebill" : "DOS"} ${formatDate(vitals.filingStartDate)}`
+        : "No service date or appeal/rebill date available",
+      tone: filing.tone,
+    },
+    {
+      key: "appeal-deadline",
+      label: "Appeal Deadline",
+      value: vitals.appealDeadline ? formatDate(vitals.appealDeadline) : "Unavailable",
+      detail: vitals.appealDeadline
+        ? `${appeal.value} · 90 days from ${vitals.filingStartReason === "appeal_or_rebill" ? "the latest appeal/rebill" : "the date of service"} ${formatDate(vitals.filingStartDate)}`
+        : "No service date or recorded appeal/rebill available",
+      tone: appeal.tone,
+    },
+  ];
+
+  return (
+    <section className="claim-vitals-summary" aria-labelledby="claim-result-heading">
+      <header className="claim-vitals-summary-header">
+        <div>
+          <p className="section-kicker">Claim Vitals</p>
+          <h2 id="claim-result-heading">{data.claim?.claimId}</h2>
+          <small>As of {formatDate(vitals.asOfDate)}</small>
+        </div>
+        <StatusBadge tone={statusTone}>{data.claim?.status}</StatusBadge>
+      </header>
+      <dl className="claim-vitals-summary-list" aria-label="Claim vitals">
+        {metrics.map((metric) => metric.expandable ? (
+          <ExpectedReimbursementRow key={metric.key} metric={metric} vitals={vitals} />
+        ) : (
+          <div
+            className={`claim-vitals-summary-row claim-vitals-summary-row-${metric.tone || "neutral"}`}
+            key={metric.key}
+            title={metric.detail}
+            aria-label={`${metric.label}: ${metric.value}. ${metric.detail}`}
+          >
+            <dt>{metric.label}</dt>
+            <dd>{metric.value}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
   );
 }
 
 export function ClaimSummary({ data, cptPaymentSnapshot, onOpenPanel }) {
   const { claim, summary, provenance } = data;
-  const paidTone = summary.totalPaid < 0 ? "danger" : summary.totalPaid > 0 ? "success" : "neutral";
-  const storyStepCount = buildClaimStory(data).length;
+  const access = data.access || { claimOverview: true, paymentsAndEra: true, supportingRecords: true };
+  const paidTone = access.paymentsAndEra && summary.totalPaid < 0
+    ? "danger"
+    : access.paymentsAndEra && summary.totalPaid > 0
+      ? "success"
+      : "neutral";
   const cptPayments = cptPaymentSnapshot?.items || [];
-  const appealRebillItems = buildAppealRebillItems(data);
+  const appealRebillItems = access.claimOverview ? buildAppealRebillItems(data) : [];
 
   function openPanel(panel, event) {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -61,31 +241,24 @@ export function ClaimSummary({ data, cptPaymentSnapshot, onOpenPanel }) {
 
   return (
     <aside className="claim-overview" aria-labelledby="claim-result-heading">
-      <div className="result-heading-row">
-        <div>
-          <p className="section-kicker">Claim located</p>
-          <h2 id="claim-result-heading">{claim.claimId}</h2>
-        </div>
-        <StatusBadge tone={paidTone}>{claim.status}</StatusBadge>
-      </div>
+      <ClaimVitalsSummary data={data} statusTone={paidTone} />
 
-      <div className="summary-grid" aria-label="Claim financial summary">
-        <SummaryMetric label="Charges" value={formatMoney(summary.charges)} />
-        <SummaryMetric label="Paid" value={formatMoney(summary.totalPaid)} tone="paid" />
-        <SummaryMetric label="Balance" value={formatMoney(summary.balance)} tone="pending" />
-        <SummaryMetric label="Story steps" value={String(storyStepCount)} />
-      </div>
+      {access.claimOverview ? (
+        <dl className="snapshot-list" aria-label="Claim snapshot">
+          <Detail label="Patient" value={claim.patientName} />
+          <Detail label="Payer" value={claim.payer} />
+          <Detail label="Service date" value={formatDate(claim.serviceDate)} />
+          <Detail label="Procedure" value={claim.procedure} />
+        </dl>
+      ) : null}
 
-      <dl className="snapshot-list" aria-label="Claim snapshot">
-        <Detail label="Patient" value={claim.patientName} />
-        <Detail label="Payer" value={claim.payer} />
-        <Detail label="Service date" value={formatDate(claim.serviceDate)} />
-        <Detail label="Procedure" value={claim.procedure} />
-      </dl>
-
-      <section className="claim-cpt-summary" aria-labelledby="claim-cpt-payment-heading">
+      {access.paymentsAndEra ? <section className="claim-cpt-summary" aria-labelledby="claim-cpt-payment-heading">
         <header>
-          <span id="claim-cpt-payment-heading">CPT payments</span>
+          <span id="claim-cpt-payment-heading">
+            {cptPaymentSnapshot?.selectedProcedure
+              ? `${cptPaymentSnapshot.selectedProcedure} ${cptPaymentSnapshot.paymentView === "received" ? "received" : "posted"} payment`
+              : `CPT ${cptPaymentSnapshot?.paymentView === "received" ? "received" : "posted"} payments`}
+          </span>
           <strong aria-live="polite">
             {cptPaymentSnapshot?.hovering
               ? `As of ${formatDate(cptPaymentSnapshot.date)}`
@@ -104,9 +277,9 @@ export function ClaimSummary({ data, cptPaymentSnapshot, onOpenPanel }) {
             ))}
           </ol>
         ) : <p>No CPT codes available</p>}
-      </section>
+      </section> : null}
 
-      <section className="claim-appeal-summary" aria-labelledby="claim-appeal-rebill-heading">
+      {access.claimOverview ? <section className="claim-appeal-summary" aria-labelledby="claim-appeal-rebill-heading">
         <header>
           <span id="claim-appeal-rebill-heading">Appeals &amp; rebills</span>
           <strong>{appealRebillItems.length}</strong>
@@ -124,32 +297,32 @@ export function ClaimSummary({ data, cptPaymentSnapshot, onOpenPanel }) {
             ))}
           </ol>
         ) : <p>No appeals or rebills recorded</p>}
-      </section>
+      </section> : null}
 
-      <div className="source-rule">
+      {access.paymentsAndEra ? <div className="source-rule">
         <span aria-hidden="true">i</span>
-        <p>{provenance.sources.length} sources reconciled. Payments follow the authoritative ERA rule.</p>
-      </div>
+        <p>{provenance.sources.length} sources reconciled. Received and posted payments are tracked separately.</p>
+      </div> : null}
 
       <nav className="claim-action-stack" aria-label="Claim record sections">
-        <button type="button" onClick={(event) => openPanel("categorization", event)}>
+        {access.supportingRecords ? <button type="button" onClick={(event) => openPanel("categorization", event)}>
           <span><i aria-hidden="true">01</i>Claim category</span>
           {data.categorization?.category?.display ? (
             <em className="claim-category-value">{data.categorization.category.display}</em>
           ) : <b aria-hidden="true">›</b>}
-        </button>
-        <button type="button" onClick={(event) => openPanel("details", event)}>
-          <span><i aria-hidden="true">02</i>Claim details</span>
+        </button> : null}
+        {access.claimOverview || access.supportingRecords ? <button type="button" onClick={(event) => openPanel("details", event)}>
+          <span><i aria-hidden="true">02</i>{access.claimOverview ? "Claim details" : "Prior authorization"}</span>
           <b aria-hidden="true">›</b>
-        </button>
-        <button type="button" onClick={(event) => openPanel("eras", event)}>
+        </button> : null}
+        {access.paymentsAndEra ? <button type="button" onClick={(event) => openPanel("eras", event)}>
           <span><i aria-hidden="true">03</i>ERA records</span>
           <em>{data.eras?.length || 0}</em>
-        </button>
-        <button type="button" onClick={(event) => openPanel("timeline", event)}>
+        </button> : null}
+        {access.claimOverview ? <button type="button" onClick={(event) => openPanel("timeline", event)}>
           <span><i aria-hidden="true">04</i>All records</span>
           <em>{data.timeline?.length || 0}</em>
-        </button>
+        </button> : null}
       </nav>
     </aside>
   );
@@ -157,6 +330,7 @@ export function ClaimSummary({ data, cptPaymentSnapshot, onOpenPanel }) {
 
 export function ClaimDetailPanel({ data }) {
   const { claim, provenance } = data;
+  const access = data.access || { claimOverview: true, paymentsAndEra: true, supportingRecords: true };
   const submissionReferences = claim.submissionReferences || [];
   const priorAuthorizations = data.priorAuthorizations || [];
 
@@ -167,17 +341,17 @@ export function ClaimDetailPanel({ data }) {
           <span>Claim</span>
           <strong>{claim.claimId}</strong>
         </div>
-        <div>
+        {access.claimOverview ? <div>
           <span>Patient</span>
           <strong>{claim.patientName || "Not provided"}</strong>
-        </div>
+        </div> : null}
         <div>
           <span>Status</span>
           <strong>{claim.status || "Not provided"}</strong>
         </div>
       </section>
 
-      <section className="detail-section">
+      {access.supportingRecords ? <section className="detail-section">
         <div className="detail-section-heading">
           <div>
             <p className="section-kicker">Appointment-linked</p>
@@ -203,9 +377,9 @@ export function ClaimDetailPanel({ data }) {
             ))}
           </div>
         ) : <p className="drawer-empty-copy">No authorization row matched this claim visit ID.</p>}
-      </section>
+      </section> : null}
 
-      <section className="detail-section">
+      {access.claimOverview ? <section className="detail-section">
         <div className="detail-section-heading">
           <div>
             <p className="section-kicker">Reconciled identity</p>
@@ -224,9 +398,9 @@ export function ClaimDetailPanel({ data }) {
           <Detail label="Procedure" value={claim.procedure} />
           <Detail label="First established" value={formatDate(claim.createdAt)} />
         </dl>
-      </section>
+      </section> : null}
 
-      <section className="detail-section">
+      {access.claimOverview ? <section className="detail-section">
         <div className="detail-section-heading">
           <div>
             <p className="section-kicker">Iteration history</p>
@@ -243,9 +417,9 @@ export function ClaimDetailPanel({ data }) {
             ))}
           </ol>
         ) : <p className="drawer-empty-copy">No ERA reference was observed for this claim.</p>}
-      </section>
+      </section> : null}
 
-      <section className="detail-section payment-rule-panel">
+      {access.paymentsAndEra ? <section className="detail-section payment-rule-panel">
         <span className="provenance-icon" aria-hidden="true">i</span>
         <div>
           <p className="section-kicker">Payment source rule</p>
@@ -253,15 +427,15 @@ export function ClaimDetailPanel({ data }) {
           <p>{provenance.paymentRule}</p>
           <p>{provenance.matchRule}</p>
         </div>
-      </section>
+      </section> : null}
 
-      <section className="reconciliation-metrics" aria-label="Reconciliation totals">
+      {access.paymentsAndEra ? <section className="reconciliation-metrics" aria-label="Reconciliation totals">
         <div><span>Duplicates removed</span><strong>{provenance.duplicatesRemoved}</strong></div>
         <div><span>ERA-matched postings</span><strong>{provenance.eraMatchedPostings}</strong></div>
         <div><span>Data notes</span><strong>{data.warnings?.length || 0}</strong></div>
-      </section>
+      </section> : null}
 
-      {data.warnings?.length ? (
+      {access.paymentsAndEra && data.warnings?.length ? (
         <section className="reconciliation-notes">
           <h3>Data quality / reconciliation notes</h3>
           <ul>{data.warnings.map((warning, index) => <li key={`${index}-${warning}`}>{warning}</li>)}</ul>

@@ -1,5 +1,7 @@
 import { Router } from "express";
+import { requirePermission } from "../permissions/userPermissions.js";
 import {
+  getClaimIcu,
   getClaimsWithoutResponse,
   getHighLevelDashboard,
   getHighLevelClaims,
@@ -7,6 +9,15 @@ import {
 } from "../services/highLevelService.js";
 
 export const highLevelRouter = Router();
+highLevelRouter.use(requirePermission("highLevelOperations"));
+
+highLevelRouter.get("/claim-icu", async (request, response, next) => {
+  try {
+    response.json(await getClaimIcu(request.query));
+  } catch (error) {
+    next(error);
+  }
+});
 
 highLevelRouter.get("/dashboard", async (request, response, next) => {
   try {

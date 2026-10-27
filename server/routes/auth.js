@@ -18,7 +18,7 @@ authRouter.get("/login", (request, response, next) => {
 
 authRouter.get("/logout", (request, response, next) => {
   try {
-    endSession(response);
+    endSession(request, response);
   } catch (error) {
     next(error);
   }

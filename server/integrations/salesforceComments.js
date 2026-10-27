@@ -176,6 +176,42 @@ function mapNote(record, caseRecord, index, settings) {
 
 let defaultClient;
 
+export async function findSalesforceClaimCases(claim, options = {}) {
+  const settings = options.settings || config.salesforce;
+  const client = options.client || (defaultClient ||= new SalesforceClient(settings));
+  const identifiers = claimIdentifierCandidates(claim);
+  if (!identifiers.length) return [];
+
+  const caseFields = [
+    "Id",
+    "CreatedDate",
+    "LastModifiedDate",
+    settings.statusField,
+    settings.claimIdField,
+    settings.icnField,
+  ].join(",");
+  const baseClaimId = String(claim.encounterId || claim.claimId || "").trim();
+  const caseClauses = [`${settings.claimIdField} IN (${identifiers.map(soqlQuote).join(",")})`];
+  if (baseClaimId) {
+    caseClauses.push(`${settings.claimIdField} LIKE ${soqlQuote(`${baseClaimId}%`)}`);
+    caseClauses.push(`${settings.claimIdField} LIKE ${soqlQuote(`ARCHIVE-${baseClaimId}%`)}`);
+  }
+  const candidateCases = await client.query(
+    `SELECT ${caseFields} FROM ${settings.caseObject} WHERE (${caseClauses.join(" OR ")}) ORDER BY CreatedDate LIMIT 201`,
+  );
+  if (candidateCases.length > 200) {
+    throw new SalesforceReadError("More than 200 Salesforce cases matched the bounded claim-family lookup");
+  }
+
+  const exactIdentifiers = new Set(identifiers.map((value) => value.toUpperCase()));
+  const canonicalBase = canonicalSalesforceClaimToken(baseClaimId);
+  return candidateCases.filter((record) => {
+    const reference = text(record[settings.claimIdField]).toUpperCase();
+    return exactIdentifiers.has(reference)
+      || (canonicalBase && canonicalSalesforceClaimToken(reference) === canonicalBase);
+  });
+}
+
 export async function readSalesforceClaimComments(claim, options = {}) {
   const settings = options.settings || config.salesforce;
   if (settings.partial) {
@@ -197,33 +233,7 @@ export async function readSalesforceClaimComments(claim, options = {}) {
   }
 
   const client = options.client || (defaultClient ||= new SalesforceClient(settings));
-  const caseFields = [
-    "Id",
-    "CreatedDate",
-    "LastModifiedDate",
-    settings.statusField,
-    settings.claimIdField,
-    settings.icnField,
-  ].join(",");
-  const baseClaimId = String(claim.encounterId || claim.claimId || "").trim();
-  const caseClauses = [`${settings.claimIdField} IN (${identifiers.map(soqlQuote).join(",")})`];
-  if (baseClaimId) {
-    caseClauses.push(`${settings.claimIdField} LIKE ${soqlQuote(`${baseClaimId}%`)}`);
-    caseClauses.push(`${settings.claimIdField} LIKE ${soqlQuote(`ARCHIVE-${baseClaimId}%`)}`);
-  }
-  const candidateCases = await client.query(
-    `SELECT ${caseFields} FROM ${settings.caseObject} WHERE (${caseClauses.join(" OR ")}) ORDER BY CreatedDate LIMIT 201`,
-  );
-  if (candidateCases.length > 200) {
-    throw new SalesforceReadError("More than 200 Salesforce cases matched the bounded claim-family lookup");
-  }
-  const exactIdentifiers = new Set(identifiers.map((value) => value.toUpperCase()));
-  const canonicalBase = canonicalSalesforceClaimToken(baseClaimId);
-  const cases = candidateCases.filter((record) => {
-    const reference = text(record[settings.claimIdField]).toUpperCase();
-    return exactIdentifiers.has(reference)
-      || (canonicalBase && canonicalSalesforceClaimToken(reference) === canonicalBase);
-  });
+  const cases = await findSalesforceClaimCases(claim, { settings, client });
   if (!cases.length) {
     return { comments: [], integration: integration("no_case", {
       message: "No Salesforce case matched the claim's exact ENCOUNTERID, correction/archive family, or alternate claim identifiers.",

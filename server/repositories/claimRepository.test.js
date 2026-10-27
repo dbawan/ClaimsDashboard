@@ -2,8 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   PATIENT_INVOICE_CPT_MAPPINGS,
+  readPatientClaimSources,
   readClaimSources,
+  searchPatientsByName,
+  searchPatientClaimsByProcedure,
 } from "./claimRepository.js";
+import { config } from "../config.js";
 
 function fakeSession(handler) {
   return {
@@ -14,6 +18,211 @@ function fakeSession(handler) {
     },
   };
 }
+
+test("patient name suggestions query only the configured EHR patient view", async () => {
+  const session = fakeSession((sql) => {
+    if (/vw_ODBC_pt_PatientInfo/.test(sql)) {
+      return [{
+        patientId: "31631",
+        fullName: "Doe, Jane",
+        firstName: "Jane",
+        lastName: "Doe",
+        dateOfBirth: "1948-02-10",
+        chartNumber: "MRN-42",
+        inactiveAt: null,
+      }];
+    }
+    return [];
+  });
+
+  const result = await searchPatientsByName(session, "Jane");
+  const query = session.queries[0];
+
+  assert.deepEqual(result.patients, [{
+    patientId: "31631",
+    name: "Jane Doe",
+    dateOfBirth: "1948-02-10",
+    chartNumber: "MRN-42",
+    inactive: false,
+  }]);
+  assert.equal(result.hasMore, false);
+  assert.match(query.sql.trim(), /^SELECT\b/);
+  assert.match(query.sql, /Patient_UID IS NOT NULL/);
+  assert.match(query.sql, /UPPER\(TRIM\(FullName\)\) LIKE UPPER\(\?\)/);
+  assert.match(query.sql, /LIMIT 11/);
+  assert.equal(query.parameters[0], config.ehr.licenseKey);
+  assert.deepEqual(query.parameters.slice(1, 7), Array(6).fill("Jane%"));
+  assert.doesNotMatch(query.sql, /\b(?:INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP|CREATE)\b/i);
+});
+
+test("selected patient claims are locked to Patient_UID and the configured transaction source", async () => {
+  const session = fakeSession((sql) => {
+    if (/FROM .*vw_ODBC_pt_PatientInfo/.test(sql)) {
+      return [{
+        patientId: "31631",
+        firstName: "Jane",
+        lastName: "Doe",
+        dateOfBirth: "1948-02-10",
+        chartNumber: "MRN-42",
+      }];
+    }
+    if (/COUNT\(\*\) AS total/.test(sql)) return [{ total: 1 }];
+    if (/SELECT CAST\(claim_rows\.ENCOUNTERID AS CHAR\) AS claimId/.test(sql)) {
+      return [{
+        claimId: "80751",
+        serviceDate: "2026-01-03",
+        lastActivityDate: "2026-01-20",
+        status: "Billed",
+        payer: "NJMCR",
+        provider: "Provider A",
+        location: "Princeton",
+        procedureCodes: "78815,A9607",
+      }];
+    }
+    return [];
+  });
+
+  const result = await readPatientClaimSources(session, "31631");
+  const claimQuery = session.queries.find(
+    ({ sql }) => /SELECT CAST\(claim_rows\.ENCOUNTERID AS CHAR\) AS claimId/.test(sql),
+  );
+
+  assert.equal(result.patient.name, "Jane Doe");
+  assert.deepEqual(result.claimRows, [{
+    claimId: "80751",
+    serviceDate: "2026-01-03",
+    lastActivityDate: "2026-01-20",
+    status: "Billed",
+    payer: "NJMCR",
+    provider: "Provider A",
+    location: "Princeton",
+    procedureCodes: ["78815", "A9607"],
+  }]);
+  assert.match(claimQuery.sql, /TRIM\(CAST\(claim_rows\.PATIENTGUID AS CHAR\)\) = \?/);
+  assert.match(claimQuery.sql, /UPPER\(TRIM\(claim_rows\.EHR\)\) = UPPER\(\?\)/);
+  assert.deepEqual(claimQuery.parameters, ["31631", config.ehr.transactionSource]);
+  assert.equal(result.total, 1);
+  assert.equal(result.hasMore, false);
+  assert.equal(result.nextOffset, null);
+  assert.equal(session.queries.length, 3);
+  for (const query of session.queries) {
+    assert.match(query.sql.trim(), /^SELECT\b/);
+    assert.doesNotMatch(query.sql, /\b(?:INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP|CREATE)\b/i);
+  }
+});
+
+test("selected patient claims apply inclusive date-of-service boundaries before the result limit", async () => {
+  const session = fakeSession((sql) => {
+    if (/FROM .*vw_ODBC_pt_PatientInfo/.test(sql)) {
+      return [{ patientId: "31631", firstName: "Jane", lastName: "Doe" }];
+    }
+    if (/COUNT\(\*\) AS total/.test(sql)) return [{ total: 0 }];
+    return [];
+  });
+
+  await readPatientClaimSources(session, "31631", {
+    startDate: "2026-01-01",
+    endDate: "2026-03-31",
+  });
+  const claimQuery = session.queries.find(
+    ({ sql }) => /SELECT CAST\(claim_rows\.ENCOUNTERID AS CHAR\) AS claimId/.test(sql),
+  );
+
+  assert.match(claimQuery.sql, /HAVING DATE\(MIN\(claim_rows\.DATEOFSERVICE\)\) >= \?/);
+  assert.match(claimQuery.sql, /AND DATE\(MIN\(claim_rows\.DATEOFSERVICE\)\) <= \?/);
+  assert.ok(claimQuery.sql.indexOf("HAVING") < claimQuery.sql.indexOf("LIMIT 26"));
+  assert.deepEqual(
+    claimQuery.parameters,
+    ["31631", config.ehr.transactionSource, "2026-01-01", "2026-03-31"],
+  );
+});
+
+test("financial patient claim lookup loads only the bounded selected claim families", async () => {
+  const session = fakeSession((sql) => {
+    if (/FROM .*vw_ODBC_pt_PatientInfo/.test(sql)) {
+      return [{ patientId: "31631", firstName: "Jane", lastName: "Doe" }];
+    }
+    if (/COUNT\(\*\) AS total/.test(sql)) return [{ total: 2 }];
+    if (/SELECT CAST\(claim_rows\.ENCOUNTERID AS CHAR\) AS claimId/.test(sql)) {
+      return [
+        { claimId: "80751", serviceDate: "2026-01-03" },
+        { claimId: "80999", serviceDate: "2026-02-03" },
+      ];
+    }
+    if (/SELECT \*.*FlattenTransctions2/s.test(sql)) {
+      return [{ ENCOUNTERID: "80751", Charges: "100.00" }];
+    }
+    if (/SELECT \*.*ClaimStatus/s.test(sql)) {
+      return [{ PatientControlNumber: "80751A", Payment: "25.00" }];
+    }
+    if (/SELECT \*.*edi_835/s.test(sql)) {
+      return [{ patient_control_number: "80999", paid_amount: "50.00" }];
+    }
+    return [];
+  });
+
+  const result = await readPatientClaimSources(session, "31631", { includeFinancials: true });
+  const transactions = session.queries.find(({ sql }) => /SELECT \*.*FlattenTransctions2/s.test(sql));
+  const claimStatus = session.queries.find(({ sql }) => /SELECT \*.*ClaimStatus/s.test(sql));
+  const edi = session.queries.find(({ sql }) => /SELECT \*.*edi_835/s.test(sql));
+
+  assert.equal(result.transactions.length, 1);
+  assert.deepEqual(transactions.parameters, ["80751", "80999"]);
+  assert.deepEqual(claimStatus.parameters, ["80751%", "80999%"]);
+  assert.deepEqual(edi.parameters, ["80751%", "80999%"]);
+  assert.match(claimStatus.sql, /PatientControlNumber LIKE \? OR PatientControlNumber LIKE \?/);
+  assert.match(edi.sql, /patient_control_number LIKE \? OR patient_control_number LIKE \?/);
+  assert.equal(session.queries.length, 7);
+});
+
+test("selected patient claims expose the next lazy-loading offset", async () => {
+  const pageRows = Array.from({ length: 26 }, (_, index) => ({
+    claimId: String(9000 - index),
+    serviceDate: `2026-03-${String(31 - index).padStart(2, "0")}`,
+  }));
+  const session = fakeSession((sql) => {
+    if (/FROM .*vw_ODBC_pt_PatientInfo/.test(sql)) {
+      return [{ patientId: "31631", firstName: "Jane", lastName: "Doe" }];
+    }
+    if (/COUNT\(\*\) AS total/.test(sql)) return [{ total: 46 }];
+    if (/SELECT CAST\(claim_rows\.ENCOUNTERID AS CHAR\) AS claimId/.test(sql)) return pageRows;
+    return [];
+  });
+
+  const result = await readPatientClaimSources(session, "31631", { offset: 0 });
+  const claimQuery = session.queries.find(({ sql }) => /LIMIT 26/.test(sql));
+
+  assert.equal(result.total, 46);
+  assert.equal(result.claimRows.length, 25);
+  assert.equal(result.hasMore, true);
+  assert.equal(result.nextOffset, 25);
+  assert.match(claimQuery.sql, /OFFSET 0/);
+});
+
+test("selected patient claim pages filter partial procedure codes before counting and limiting", async () => {
+  const session = fakeSession((sql) => {
+    if (/FROM .*vw_ODBC_pt_PatientInfo/.test(sql)) {
+      return [{ patientId: "31631", firstName: "Jane", lastName: "Doe" }];
+    }
+    if (/COUNT\(\*\) AS total/.test(sql)) return [{ total: 7 }];
+    return [];
+  });
+
+  const result = await readPatientClaimSources(session, "31631", {
+    procedureQuery: "A96",
+  });
+  const filteredQueries = session.queries.filter(
+    ({ sql }) => /procedure_rows\.PROCEDURECODE/.test(sql),
+  );
+
+  assert.equal(result.total, 7);
+  assert.equal(filteredQueries.length, 2);
+  for (const query of filteredQueries) {
+    assert.match(query.sql, /procedure_rows\.ENCOUNTERID = claim_rows\.ENCOUNTERID/);
+    assert.match(query.sql, /UPPER\(TRIM\(procedure_rows\.PROCEDURECODE\)\) LIKE \?/);
+    assert.deepEqual(query.parameters, ["31631", config.ehr.transactionSource, "%A96%"]);
+  }
+});
 
 test("repository anchors rows on ENCOUNTERID and queries only its letter-suffix ERA family", async () => {
   const session = fakeSession((sql) => {
@@ -50,6 +259,80 @@ test("repository anchors rows on ENCOUNTERID and queries only its letter-suffix 
   assert.match(priorAuthorizationLoad.sql, /aa\.AppointmentFID = \?/);
   assert.equal(priorAuthorizationLoad.parameters[1], "78820");
   assert.doesNotMatch(priorAuthorizationLoad.sql, /\b(?:INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP|CREATE)\b/i);
+});
+
+test("patient claim lookup locks the search to PATIENTGUID and an exact procedure code", async () => {
+  const session = fakeSession((sql) => {
+    if (/WHERE ENCOUNTERID = \?\s+LIMIT 2/.test(sql)) return [{ encounterId: "80751" }];
+    if (/claim\.patient-claim-lookup\.identity/.test(sql)) return [];
+    if (/NULLIF\(TRIM\(CAST\(PATIENTGUID/.test(sql)) return [{
+      patientGuid: "31631",
+      ehr: "AMD",
+      firstName: "Jane",
+      lastName: "Doe",
+      dateOfBirth: "1948-02-10",
+    }];
+    if (/AS matching_claims/.test(sql)) return [{
+      claimId: "80999",
+      serviceDate: "2026-05-03",
+      lastActivityDate: "2026-05-20",
+      status: "Billed",
+      payer: "NJMCR",
+      provider: "Provider A",
+      location: "Princeton",
+      procedureCodes: "79101,A9607",
+    }];
+    return [];
+  });
+
+  const result = await searchPatientClaimsByProcedure(session, "80751", "a9607");
+  const identityQuery = session.queries.find(({ sql }) => /NULLIF\(TRIM\(CAST\(PATIENTGUID/.test(sql));
+  const searchQuery = session.queries.find(({ sql }) => /AS matching_claims/.test(sql));
+
+  assert.equal(result.patientName, "Jane Doe");
+  assert.equal(result.matchedCode, "A9607");
+  assert.equal(result.matchMethod, "patient_guid");
+  assert.deepEqual(result.claims, [{
+    claimId: "80999",
+    serviceDate: "2026-05-03",
+    lastActivityDate: "2026-05-20",
+    status: "Billed",
+    payer: "NJMCR",
+    provider: "Provider A",
+    location: "Princeton",
+    matchedCode: "A9607",
+    procedureCodes: ["79101", "A9607"],
+  }]);
+  assert.deepEqual(identityQuery.parameters, ["80751"]);
+  assert.match(searchQuery.sql, /TRIM\(CAST\(PATIENTGUID AS CHAR\)\) = \?/);
+  assert.match(searchQuery.sql, /UPPER\(TRIM\(EHR\)\) = UPPER\(\?\)/);
+  assert.match(searchQuery.sql, /UPPER\(TRIM\(PROCEDURECODE\)\) = \?/);
+  assert.deepEqual(searchQuery.parameters, ["31631", "AMD", "A9607"]);
+  assert.match(searchQuery.sql.trim(), /^SELECT\b/);
+  assert.doesNotMatch(searchQuery.sql, /\b(?:INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP|CREATE)\b/i);
+});
+
+test("patient claim lookup uses exact name and DOB only when PATIENTGUID is unavailable", async () => {
+  const session = fakeSession((sql) => {
+    if (/WHERE ENCOUNTERID = \?\s+LIMIT 2/.test(sql)) return [{ encounterId: "80751" }];
+    if (/NULLIF\(TRIM\(CAST\(PATIENTGUID/.test(sql)) return [{
+      patientGuid: null,
+      firstName: "Jane",
+      lastName: "Doe",
+      dateOfBirth: "1948-02-10",
+    }];
+    if (/AS matching_claims/.test(sql)) return [];
+    return [];
+  });
+
+  const result = await searchPatientClaimsByProcedure(session, "80751", "78815");
+  const searchQuery = session.queries.find(({ sql }) => /AS matching_claims/.test(sql));
+
+  assert.equal(result.matchMethod, "name_and_date_of_birth");
+  assert.match(searchQuery.sql, /UPPER\(TRIM\(FIRSTNAME\)\) = UPPER\(\?\)/);
+  assert.match(searchQuery.sql, /UPPER\(TRIM\(LASTNAME\)\) = UPPER\(\?\)/);
+  assert.match(searchQuery.sql, /DATE\(DOB\) = \?/);
+  assert.deepEqual(searchQuery.parameters, ["Jane", "Doe", "1948-02-10", "78815"]);
 });
 
 test("a suffixed ERA reference resolves back to its canonical ENCOUNTERID", async () => {

@@ -84,7 +84,8 @@ function DashboardHoverBubble({ point, position, id }) {
       </header>
       <dl>
         <div><dt>Exact billed</dt><dd>{formatExactMoney(point.billed)}</dd></div>
-        <div><dt>Exact received</dt><dd className="amount-positive">{formatExactMoney(point.paid)}</dd></div>
+        <div><dt>Posted payment (net)</dt><dd>{formatExactMoney(point.posted)}</dd></div>
+        <div><dt>Payment received</dt><dd className="amount-positive">{formatExactMoney(point.paid)}</dd></div>
         <div><dt>Exact recouped</dt><dd className="amount-negative">{formatExactMoney(point.recouped)}</dd></div>
         <div><dt>Remittance lines</dt><dd>{point.paymentLineCount.toLocaleString()}</dd></div>
         <div><dt>Denied lines</dt><dd>{point.deniedLineCount.toLocaleString()}</dd></div>
@@ -128,12 +129,13 @@ function DashboardLineChart({ data, billingMode, onBillingModeChange, visibleSer
   const width = 900;
   const height = 244;
   const plot = { left: 68, right: 884, top: 12, bottom: 190 };
-  const minimum = visibleSeries.recouped
-    ? Math.min(0, ...data.daily.map((point) => point.recouped))
-    : 0;
+  const minimum = Math.min(0, ...data.daily.flatMap((point) => [
+    visibleSeries.recouped ? point.recouped : 0, visibleSeries.posted ? point.posted || 0 : 0,
+  ]));
   const maximum = Math.max(1, ...data.daily.flatMap((point) => [
     visibleSeries.billed ? point.billed : 0,
     visibleSeries.paid ? point.paid : 0,
+    visibleSeries.posted ? point.posted || 0 : 0,
   ]));
   const rawRange = maximum - minimum || 1;
   const yMinimum = minimum < 0 ? minimum - rawRange * 0.06 : 0;
@@ -150,6 +152,7 @@ function DashboardLineChart({ data, billingMode, onBillingModeChange, visibleSer
   const nonzeroPoints = data.daily
     .map((point, index) => ({ ...point, index }))
     .filter((point) => (visibleSeries.billed && point.billed)
+      || (visibleSeries.posted && point.posted)
       || (visibleSeries.paid && point.paid)
       || (visibleSeries.recouped && point.recouped));
   const [hover, setHover] = useState(null);
@@ -182,7 +185,9 @@ function DashboardLineChart({ data, billingMode, onBillingModeChange, visibleSer
     const point = data.daily[index];
     const focusValue = visibleSeries.billed
       ? point?.billed
-      : visibleSeries.paid
+      : visibleSeries.posted
+        ? point?.posted
+        : visibleSeries.paid
         ? point?.paid
         : visibleSeries.recouped
           ? point?.recouped
@@ -197,7 +202,7 @@ function DashboardLineChart({ data, billingMode, onBillingModeChange, visibleSer
       <header>
         <div>
           <span>Daily financial movement · hover for details · click to select</span>
-          <h2 id="dashboard-financial-heading">Billed, received, and recouped</h2>
+          <h2 id="dashboard-financial-heading">Billed, posted, and received payments</h2>
         </div>
         <div className="dashboard-chart-tools">
           <div className="dashboard-billing-switch" role="group" aria-label="Claim billing submissions">
@@ -207,8 +212,9 @@ function DashboardLineChart({ data, billingMode, onBillingModeChange, visibleSer
           </div>
           <div className="dashboard-series-switch" role="group" aria-label="Visible financial lines">
             <button type="button" aria-pressed={visibleSeries.billed} onClick={() => onToggleSeries("billed")}><i className="dashboard-legend-billed" />Amount billed</button>
-            <button type="button" aria-pressed={visibleSeries.paid} onClick={() => onToggleSeries("paid")}><i className="dashboard-legend-paid" />Amount received</button>
-            <button type="button" aria-pressed={visibleSeries.recouped} onClick={() => onToggleSeries("recouped")}><i className="dashboard-legend-recouped" />Recoupments</button>
+            <button type="button" aria-pressed={visibleSeries.posted} onClick={() => onToggleSeries("posted")}><i className="dashboard-legend-posted" />Posted payment</button>
+            <button type="button" aria-pressed={visibleSeries.paid} onClick={() => onToggleSeries("paid")}><i className="dashboard-legend-paid" />Payment received</button>
+            <button type="button" aria-pressed={visibleSeries.recouped} onClick={() => onToggleSeries("recouped")}><i className="dashboard-legend-recouped" />ERA recoupments</button>
           </div>
         </div>
       </header>
@@ -218,7 +224,7 @@ function DashboardLineChart({ data, billingMode, onBillingModeChange, visibleSer
         role="img"
         tabIndex="0"
         aria-describedby={hover ? tooltipId : undefined}
-        aria-label={`${formatMoney(data.totals.billed)} billed, ${formatMoney(data.totals.paid)} received, and ${formatMoney(Math.abs(data.totals.recouped))} recouped from ${formatDate(data.start)} through ${formatDate(data.end)}. Hover or use arrow keys for daily details, then click or press Enter to select a date.`}
+        aria-label={`${formatMoney(data.totals.billed)} billed, ${formatMoney(data.totals.posted)} posted, ${formatMoney(data.totals.paid)} received, and ${formatMoney(Math.abs(data.totals.recouped))} recouped from ${formatDate(data.start)} through ${formatDate(data.end)}. Hover or use arrow keys for daily details, then click or press Enter to select a date.`}
         onPointerMove={(event) => updateHover(event.clientX, event.clientY)}
         onPointerLeave={() => setHover(null)}
         onClick={(event) => {
@@ -247,11 +253,13 @@ function DashboardLineChart({ data, billingMode, onBillingModeChange, visibleSer
         ))}
         {yMinimum < 0 ? <line className="dashboard-zero-line" x1={plot.left} x2={plot.right} y1={yScale(0)} y2={yScale(0)} /> : null}
         {visibleSeries.billed ? <path className="dashboard-billed-line" d={seriesPath(data.daily, "billed", xScale, yScale)} /> : null}
+        {visibleSeries.posted ? <path className="dashboard-posted-line" d={seriesPath(data.daily, "posted", xScale, yScale)} /> : null}
         {visibleSeries.paid ? <path className="dashboard-paid-line" d={seriesPath(data.daily, "paid", xScale, yScale)} /> : null}
         {visibleSeries.recouped ? <path className="dashboard-recouped-line" d={seriesPath(data.daily, "recouped", xScale, yScale)} /> : null}
         {nonzeroPoints.map((point) => (
           <g key={point.date}>
             {visibleSeries.billed && point.billed ? <circle className="dashboard-billed-point" cx={xScale(point.index)} cy={yScale(point.billed)} r="3.5" /> : null}
+            {visibleSeries.posted && point.posted ? <circle className="dashboard-posted-point" cx={xScale(point.index)} cy={yScale(point.posted)} r="3.5" /> : null}
             {visibleSeries.paid && point.paid ? <circle className="dashboard-paid-point" cx={xScale(point.index)} cy={yScale(point.paid)} r="3.5" /> : null}
             {visibleSeries.recouped && point.recouped ? <circle className="dashboard-recouped-point" cx={xScale(point.index)} cy={yScale(point.recouped)} r="3.5" /> : null}
           </g>
@@ -265,6 +273,7 @@ function DashboardLineChart({ data, billingMode, onBillingModeChange, visibleSer
           <g className="dashboard-hover-marker" aria-hidden="true">
             <line x1={xScale(hover.index)} x2={xScale(hover.index)} y1={plot.top} y2={plot.bottom} />
             {visibleSeries.billed ? <circle cx={xScale(hover.index)} cy={yScale(hoverPoint.billed)} r="5" className="dashboard-billed-point" /> : null}
+            {visibleSeries.posted ? <circle cx={xScale(hover.index)} cy={yScale(hoverPoint.posted)} r="5" className="dashboard-posted-point" /> : null}
             {visibleSeries.paid ? <circle cx={xScale(hover.index)} cy={yScale(hoverPoint.paid)} r="5" className="dashboard-paid-point" /> : null}
             {visibleSeries.recouped ? <circle cx={xScale(hover.index)} cy={yScale(hoverPoint.recouped)} r="5" className="dashboard-recouped-point" /> : null}
           </g>
@@ -317,7 +326,7 @@ function DailyClaimLists({ point }) {
     return (
       <section className="dashboard-date-selection dashboard-date-selection-empty">
         <strong>Select a date on the graph</strong>
-        <span>The billed, paid, and recouped claim lists for that date will appear here.</span>
+        <span>The billed, posted, received, and recouped claim lists for that date will appear here.</span>
       </section>
     );
   }
@@ -328,11 +337,13 @@ function DailyClaimLists({ point }) {
         <div><span>Selected date</span><h2 id="dashboard-selected-date-heading">{formatDate(point.date)}</h2></div>
         <dl>
           <div><dt>Billed</dt><dd>{formatExactMoney(point.billed)}</dd></div>
+          <div><dt>Posted</dt><dd>{formatExactMoney(point.posted)}</dd></div>
           <div><dt>Received</dt><dd className="amount-positive">{formatExactMoney(point.paid)}</dd></div>
           <div><dt>Recouped</dt><dd className="amount-negative">{formatExactMoney(point.recouped)}</dd></div>
         </dl>
       </header>
       <div className="dashboard-date-claim-columns">
+        <DailyClaimList title="Posted payments" tone="posted" claims={point.postedClaims || []} amountField="posted" emptyMessage="No payments were posted on this date." />
         <DailyClaimList
           title="Claims billed"
           tone="billed"
@@ -341,7 +352,7 @@ function DailyClaimLists({ point }) {
           emptyMessage="No claims were billed on this date."
         />
         <DailyClaimList
-          title="Claims paid"
+          title="Payments received"
           tone="paid"
           claims={point.paidClaims}
           amountField="paid"
@@ -566,7 +577,8 @@ export function HighLevelDashboard({
   return (
     <div className="high-level-dashboard">
       <section className="dashboard-metrics" aria-label="Dashboard totals">
-        <Metric label="Payments received" value={formatMoney(data.totals.paid)} detail={`${paymentRate.toFixed(1)}% of billed · ${formatMoney(Math.abs(data.totals.recouped))} recouped`} tone="green" />
+        <Metric label="Posted payment" value={formatMoney(data.totals.posted)} detail="Net ledger amount · posting date" tone="green" />
+        <Metric label="Payment received" value={formatMoney(data.totals.paid)} detail={`${paymentRate.toFixed(1)}% of billed · ${formatMoney(Math.abs(data.totals.recouped))} recouped`} tone="green" />
         <Metric
           label="Total billed"
           value={formatMoney(data.totals.billed)}

@@ -1,0 +1,13 @@
+CREATE TABLE IF NOT EXISTS `UniLocus`.`claims_dashboard_user_permissions` (
+  `cognito_uid` VARCHAR(128) NOT NULL,
+  `claim_overview` BOOLEAN NOT NULL DEFAULT TRUE,
+  `payments_and_era` BOOLEAN NOT NULL DEFAULT TRUE,
+  `supporting_records` BOOLEAN NOT NULL DEFAULT TRUE,
+  `high_level_operations` BOOLEAN NOT NULL DEFAULT TRUE,
+  `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `last_login_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`cognito_uid`)
+) ENGINE=InnoDB
+  DEFAULT CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;

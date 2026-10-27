@@ -1,3 +1,5 @@
+import { pathWithinApp } from "../../lib/appPath.js";
+
 function elapsedMs(startedAt) {
   return Math.round(performance.now() - startedAt);
 }
@@ -55,15 +57,38 @@ async function fetchJson(path, { signal, debugLabel = "request", timeoutMs = 25_
   return payload;
 }
 
-export function fetchHighLevelClaims({ start, end, limit, sort }, options) {
-  const query = new URLSearchParams({ start, end, limit: String(limit), sort });
-  return fetchJson(`/api/high-level/claims?${query}`, { ...options, debugLabel: "claims" });
+export function fetchHighLevelClaims({ start, end, limit, page = 1, sort, procedureQuery = "" }, options) {
+  const query = new URLSearchParams({ start, end, limit: String(limit), page: String(page), sort });
+  if (procedureQuery) query.set("procedureQuery", procedureQuery);
+  return fetchJson(`${pathWithinApp("/api/high-level/claims")}?${query}`, { ...options, debugLabel: "claims" });
 }
 
-export function fetchHighLevelDashboard({ start, end, billingMode = "all", payers = [] }, options) {
+export function fetchHighLevelClaimIcu({
+  limit = 25,
+  page = 1,
+  sort = "deadline",
+  includePastDeadline = false,
+  procedureQuery = "",
+} = {}, options) {
+  const query = new URLSearchParams({
+    limit: String(limit),
+    page: String(page),
+    sort,
+    includePastDeadline: String(Boolean(includePastDeadline)),
+  });
+  if (procedureQuery) query.set("procedureQuery", procedureQuery);
+  return fetchJson(`${pathWithinApp("/api/high-level/claim-icu")}?${query}`, {
+    ...options,
+    debugLabel: "claim-icu",
+    timeoutMs: 45_000,
+  });
+}
+
+export function fetchHighLevelDashboard({ start, end, billingMode = "all", payers = [], procedureQuery = "" }, options) {
   const query = new URLSearchParams({ start, end, billingMode });
+  if (procedureQuery) query.set("procedureQuery", procedureQuery);
   for (const payer of payers) query.append("payer", payer);
-  return fetchJson(`/api/high-level/dashboard?${query}`, {
+  return fetchJson(`${pathWithinApp("/api/high-level/dashboard")}?${query}`, {
     ...options,
     debugLabel: "dashboard",
     timeoutMs: 45_000,
@@ -80,7 +105,7 @@ export function fetchHighLevelQueue(mode, filters, options) {
     order: filters?.order || "oldest",
     scope: mode === "unsubmitted" ? "all" : filters?.scope || "all",
   });
-  return fetchJson(`/api/high-level/${mode}?${query}`, {
+  return fetchJson(`${pathWithinApp(`/api/high-level/${mode}`)}?${query}`, {
     ...options,
     debugLabel: mode,
     timeoutMs: mode === "no-response" ? 45_000 : 25_000,

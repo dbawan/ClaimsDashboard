@@ -3,6 +3,7 @@ import { ClaimCategorizationPanel } from "./ClaimCategorizationPanel.jsx";
 import { ClaimDetailPanel, formatDate, formatMoney } from "./ClaimSummary.jsx";
 import { ClaimEraList } from "./ClaimEraList.jsx";
 import { ClaimTimeline } from "./ClaimTimeline.jsx";
+import { eventProcedureCodes, scopeClaimDataToProcedure } from "./claimStoryModel.js";
 
 const PANELS = Object.freeze({
   categorization: { label: "Claim category", kicker: "RCM Claims API", icon: "01" },
@@ -11,7 +12,18 @@ const PANELS = Object.freeze({
   timeline: { label: "All records", kicker: "Source-level history", icon: "04" },
 });
 
-function PreviewRows({ data, activePanel }) {
+function availablePanels(access) {
+  return Object.entries(PANELS).filter(([key]) => {
+    if (key === "categorization") return access.supportingRecords;
+    if (key === "details") return access.claimOverview || access.supportingRecords;
+    if (key === "eras") return access.paymentsAndEra;
+    if (key === "timeline") return access.claimOverview;
+    return false;
+  });
+}
+
+function PreviewRows({ data, activePanel, selectedProcedure }) {
+  const access = data.access || { claimOverview: true, paymentsAndEra: true, supportingRecords: true };
   if (activePanel === "categorization") {
     const claim = data.categorization;
     return (
@@ -24,6 +36,16 @@ function PreviewRows({ data, activePanel }) {
   }
 
   if (activePanel === "details") {
+    if (!access.claimOverview) {
+      const latestAuthorization = data.priorAuthorizations?.at(-1);
+      return (
+        <span className="claim-record-preview-rows">
+          <span><small>Authorizations</small><strong>{data.priorAuthorizations?.length || 0}</strong></span>
+          <span><small>Latest status</small><strong>{latestAuthorization?.status || "Not provided"}</strong></span>
+          <span><small>Claim</small><strong>{data.claim.claimId}</strong></span>
+        </span>
+      );
+    }
     return (
       <span className="claim-record-preview-rows">
         <span><small>Patient</small><strong>{data.claim.patientName || "Not provided"}</strong></span>
@@ -44,7 +66,10 @@ function PreviewRows({ data, activePanel }) {
     );
   }
 
-  const latestEvents = [...(data.timeline || [])].filter((event) => event.date).slice(-2).reverse();
+  const latestEvents = [...(data.timeline || [])]
+    .filter((event) => event.date && (!selectedProcedure || eventProcedureCodes(event).includes(selectedProcedure)))
+    .slice(-2)
+    .reverse();
   return (
     <span className="claim-record-preview-events">
       {latestEvents.length ? latestEvents.map((event) => (
@@ -54,13 +79,21 @@ function PreviewRows({ data, activePanel }) {
   );
 }
 
-export function ClaimDetailDrawer({ data, activePanel, origin, onChangePanel, onClose }) {
+export function ClaimDetailDrawer({ data, activePanel, origin, selectedProcedure, onChangePanel, onClose }) {
   const [mode, setMode] = useState("preview");
   const layerRef = useRef(null);
   const previewRef = useRef(null);
   const closeRef = useRef(null);
   const titleId = useId();
-  const panel = PANELS[activePanel] || PANELS.details;
+  const access = data.access || { claimOverview: true, paymentsAndEra: true, supportingRecords: true };
+  const panels = availablePanels(access);
+  const basePanel = PANELS[activePanel] || panels[0]?.[1] || PANELS.details;
+  const panel = activePanel === "timeline" && selectedProcedure
+    ? { ...basePanel, label: `${selectedProcedure} records`, kicker: "CPT-specific history" }
+    : basePanel;
+  const selectedRecordCount = selectedProcedure
+    ? scopeClaimDataToProcedure(data, selectedProcedure).timeline.length
+    : data.timeline?.length || 0;
   const resolvedOrigin = origin || { left: 280, bottom: 18 };
 
   useEffect(() => {
@@ -141,7 +174,7 @@ export function ClaimDetailDrawer({ data, activePanel, origin, onChangePanel, on
                   <span><small>{panel.kicker}</small><strong>{panel.label}</strong></span>
                   <em>Claim {data.claim.claimId}</em>
                 </span>
-                <PreviewRows data={data} activePanel={activePanel} />
+                <PreviewRows data={data} activePanel={activePanel} selectedProcedure={selectedProcedure} />
               </span>
               <span className="claim-record-preview-open" aria-hidden="true">↗</span>
             </button>
@@ -161,7 +194,7 @@ export function ClaimDetailDrawer({ data, activePanel, origin, onChangePanel, on
             </header>
 
             <nav className="drawer-tabs" aria-label="Claim record sections">
-              {Object.entries(PANELS).map(([key, item]) => (
+              {panels.map(([key, item]) => (
                 <button
                   type="button"
                   key={key}
@@ -169,18 +202,20 @@ export function ClaimDetailDrawer({ data, activePanel, origin, onChangePanel, on
                   aria-current={key === activePanel ? "page" : undefined}
                   onClick={() => onChangePanel(key)}
                 >
-                  {item.label}
+                  {key === "timeline" && selectedProcedure ? `${selectedProcedure} records` : item.label}
                   {key === "eras" ? <span>{data.eras?.length || 0}</span> : null}
-                  {key === "timeline" ? <span>{data.timeline?.length || 0}</span> : null}
+                  {key === "timeline" ? <span>{selectedRecordCount}</span> : null}
                 </button>
               ))}
             </nav>
 
             <div className="drawer-content">
-              {activePanel === "categorization" ? <ClaimCategorizationPanel data={data} /> : null}
-              {activePanel === "details" ? <ClaimDetailPanel data={data} /> : null}
-              {activePanel === "eras" ? <ClaimEraList data={data} /> : null}
-              {activePanel === "timeline" ? <ClaimTimeline data={data} defaultExpanded /> : null}
+              {activePanel === "categorization" && access.supportingRecords ? <ClaimCategorizationPanel data={data} /> : null}
+              {activePanel === "details" && (access.claimOverview || access.supportingRecords) ? <ClaimDetailPanel data={data} /> : null}
+              {activePanel === "eras" && access.paymentsAndEra ? <ClaimEraList data={data} /> : null}
+              {activePanel === "timeline" && access.claimOverview ? (
+                <ClaimTimeline data={data} selectedProcedure={selectedProcedure} defaultExpanded />
+              ) : null}
             </div>
           </div>
         )}

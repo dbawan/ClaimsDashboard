@@ -1,11 +1,13 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
+import { resolveApplicationProfile } from "../appEnvironment.js";
 
 const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
 export const projectRoot = path.resolve(serverDirectory, "..");
 
 dotenv.config({ path: path.join(projectRoot, ".env") });
+const applicationProfile = resolveApplicationProfile(process.env);
 
 function asBoolean(value, fallback = false) {
   if (value == null || value === "") return fallback;
@@ -34,6 +36,14 @@ function positiveInteger(value, fallback, name) {
   const candidate = Number(value ?? fallback);
   if (!Number.isInteger(candidate) || candidate <= 0) {
     throw new Error(`${name} must be a positive integer`);
+  }
+  return candidate;
+}
+
+function percentage(value, fallback, name) {
+  const candidate = Number(value ?? fallback);
+  if (!Number.isFinite(candidate) || candidate <= 0 || candidate > 100) {
+    throw new Error(`${name} must be greater than 0 and no more than 100`);
   }
   return candidate;
 }
@@ -69,6 +79,25 @@ function applicationOrigin(value) {
   return parsed.origin;
 }
 
+function applicationBasePath(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate || candidate === "/") return "";
+  if (!candidate.startsWith("/")
+    || candidate.endsWith("/")
+    || candidate.includes("//")
+    || !/^\/[A-Za-z0-9._~/-]+$/.test(candidate)) {
+    throw new Error("APP_BASE_PATH must be empty or a URL path such as /dashboardapp without a trailing slash");
+  }
+  return candidate;
+}
+
+function pathWithinApplication(basePath, value = "/") {
+  const pathValue = String(value || "/").startsWith("/")
+    ? String(value || "/")
+    : `/${value}`;
+  return pathValue === "/" ? `${basePath}/` || "/" : `${basePath}${pathValue}`;
+}
+
 function commaSeparated(value, fallback = "") {
   return [...new Set(String(value ?? fallback)
     .split(",")
@@ -80,6 +109,14 @@ function salesforceApiVersion(value) {
   const candidate = String(value || "v61.0").trim();
   if (!/^v\d+\.\d+$/i.test(candidate)) {
     throw new Error("SF_API_VERSION must use a value such as v61.0");
+  }
+  return candidate;
+}
+
+function salesforceRecordTypeName(value) {
+  const candidate = String(value || "Claim").trim();
+  if (!candidate || candidate.length > 80 || /[\u0000-\u001F\u007F]/.test(candidate)) {
+    throw new Error("SF_NOTE_RECORD_TYPE must be a valid Salesforce record type name");
   }
   return candidate;
 }
@@ -111,7 +148,9 @@ const geminiApiKeyIntegration = optionalIntegration([process.env.GEMINI_API_KEY]
 const vertexIntegration = optionalIntegration(vertexCredentials);
 const geminiConfigured = geminiApiKeyIntegration.configured || vertexIntegration.configured;
 const geminiPartial = !geminiConfigured && (geminiApiKeyIntegration.partial || vertexIntegration.partial);
-const appOrigin = applicationOrigin(process.env.APP_ORIGIN);
+const appOrigin = applicationOrigin(applicationProfile.appOrigin);
+const appBasePath = applicationBasePath(applicationProfile.appBasePath);
+const appPath = (value) => pathWithinApplication(appBasePath, value);
 const cognitoBaseUri = httpsUrl(
   process.env.COGNITO_BASE_URI,
   "https://unithera.auth.us-east-1.amazoncognito.com",
@@ -126,12 +165,18 @@ const cognitoUserPoolId = String(
 ).trim();
 const cognitoRegion = String(process.env.COGNITO_REGION || "us-east-1").trim();
 const ssoEnabled = asBoolean(process.env.SSO_ENABLED, true);
+const permissionsDbHost = String(process.env.PERMISSIONS_DB_HOST || "").trim();
+const permissionsDbUser = String(process.env.PERMISSIONS_DB_USER || "").trim();
 
 export const config = Object.freeze({
-  port: Number(process.env.PORT || 4200),
-  host: safeHost(process.env.HOST),
+  environment: applicationProfile.name,
+  port: applicationProfile.port,
+  host: safeHost(applicationProfile.host),
   isProduction: process.env.NODE_ENV === "production",
   appOrigin,
+  basePath: appBasePath,
+  appUrl: `${appOrigin}${appBasePath}`,
+  appPath,
   sso: Object.freeze({
     enabled: ssoEnabled,
     configured: Boolean(cognitoBaseUri && cognitoClientId && cognitoClientSecret && cognitoUserPoolId),
@@ -141,18 +186,23 @@ export const config = Object.freeze({
     userPoolId: cognitoUserPoolId,
     region: cognitoRegion,
     issuer: `https://cognito-idp.${cognitoRegion}.amazonaws.com/${cognitoUserPoolId}`,
-    redirectUri: new URL("/callback", appOrigin).toString(),
-    logoutUri: appOrigin,
+    redirectUri: new URL(appPath("/callback"), `${appOrigin}/`).toString(),
+    logoutUri: `${appOrigin}${appBasePath}`,
     scopes: commaSeparated(process.env.COGNITO_SCOPES, "openid,profile,email"),
     allowedGroups: commaSeparated(
       process.env.COGNITO_ALLOWED_GROUPS,
       "",
     ),
     secureCookies: new URL(appOrigin).protocol === "https:",
-    refreshCookieDays: positiveInteger(
-      process.env.COGNITO_REFRESH_COOKIE_DAYS,
+    sessionDays: positiveInteger(
+      process.env.COGNITO_SESSION_DAYS ?? process.env.COGNITO_REFRESH_COOKIE_DAYS,
       30,
-      "COGNITO_REFRESH_COOKIE_DAYS",
+      "COGNITO_SESSION_DAYS",
+    ),
+    maxSessions: positiveInteger(
+      process.env.COGNITO_MAX_SESSIONS,
+      2_000,
+      "COGNITO_MAX_SESSIONS",
     ),
     requestTimeoutMs: positiveInteger(
       process.env.COGNITO_REQUEST_TIMEOUT_MS,
@@ -170,6 +220,49 @@ export const config = Object.freeze({
     connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 5),
     queryTimeoutMs: positiveInteger(process.env.DB_QUERY_TIMEOUT_MS, 20_000, "DB_QUERY_TIMEOUT_MS"),
   }),
+  permissionsDb: Object.freeze({
+    configured: Boolean(permissionsDbHost && permissionsDbUser),
+    host: permissionsDbHost,
+    port: positiveInteger(
+      process.env.PERMISSIONS_DB_PORT,
+      3306,
+      "PERMISSIONS_DB_PORT",
+    ),
+    user: permissionsDbUser,
+    password: process.env.PERMISSIONS_DB_PASSWORD || "",
+    ssl: asBoolean(process.env.PERMISSIONS_DB_SSL, false),
+    connectionLimit: positiveInteger(
+      process.env.PERMISSIONS_DB_CONNECTION_LIMIT,
+      2,
+      "PERMISSIONS_DB_CONNECTION_LIMIT",
+    ),
+    queryTimeoutMs: positiveInteger(
+      process.env.PERMISSIONS_DB_QUERY_TIMEOUT_MS,
+      10_000,
+      "PERMISSIONS_DB_QUERY_TIMEOUT_MS",
+    ),
+  }),
+  userPermissions: Object.freeze({
+    schema: safeIdentifier(process.env.USER_PERMISSIONS_SCHEMA, "UniLocus"),
+    table: safeIdentifier(
+      process.env.USER_PERMISSIONS_TABLE,
+      "claims_dashboard_user_permissions",
+    ),
+  }),
+  worklists: Object.freeze({
+    schema: safeIdentifier(
+      process.env.WORKLIST_SCHEMA || process.env.USER_PERMISSIONS_SCHEMA,
+      "UniLocus",
+    ),
+    typesTable: safeIdentifier(
+      process.env.WORKLIST_TYPES_TABLE,
+      "claims_dashboard_worklist_types",
+    ),
+    claimsTable: safeIdentifier(
+      process.env.CLAIM_WORKLISTS_TABLE,
+      "claims_dashboard_claim_worklists",
+    ),
+  }),
   schemas: Object.freeze({
     transactions: safeIdentifier(process.env.UNIDATA_SCHEMA, "unidata"),
     claimStatus: safeIdentifier(process.env.UNICOIN_SCHEMA, "uniCoin"),
@@ -178,6 +271,14 @@ export const config = Object.freeze({
   }),
   ehr: Object.freeze({
     licenseKey: positiveInteger(process.env.EHR_LICENSE_KEY, 161549, "EHR_LICENSE_KEY"),
+    transactionSource: String(process.env.EHR_TRANSACTION_SOURCE || "AMD").trim() || "AMD",
+  }),
+  claims: Object.freeze({
+    paidThresholdPercent: percentage(
+      process.env.CLAIM_PAID_THRESHOLD_PERCENT,
+      50,
+      "CLAIM_PAID_THRESHOLD_PERCENT",
+    ),
   }),
   tables: Object.freeze({
     transactions: safeIdentifier(
@@ -186,6 +287,7 @@ export const config = Object.freeze({
     ),
     claimStatus: safeIdentifier(process.env.CLAIM_STATUS_TABLE, "ClaimStatus"),
     patientInvoices: safeIdentifier(process.env.PATIENT_INVOICE_TABLE, "patient_invoices"),
+    patientInfo: safeIdentifier(process.env.EHR_PATIENT_TABLE, "vw_ODBC_pt_PatientInfo"),
     edi: safeIdentifier(process.env.EDI_835_TABLE, "edi_835"),
   }),
   claimsApi: Object.freeze({
@@ -222,6 +324,13 @@ export const config = Object.freeze({
     noteClearedField: safeIdentifier(process.env.SF_NOTE_CLEARED_FIELD, "UniSuite_Cleared_Date__c"),
     noteIssueField: safeIdentifier(process.env.SF_NOTE_ISSUE_FIELD, "UniSuite_Issue_Date__c"),
     notePostingIssueField: safeIdentifier(process.env.SF_NOTE_POSTING_ISSUE_FIELD, "UniSuite_Payment_Posting_Issue__c"),
+    noteWritesEnabled: asBoolean(process.env.SF_NOTE_WRITES_ENABLED, false),
+    noteWriterGroups: commaSeparated(process.env.SF_NOTE_WRITER_GROUPS, ""),
+    noteRecordType: salesforceRecordTypeName(process.env.SF_NOTE_RECORD_TYPE),
+    noteMaxChars: Math.min(
+      positiveInteger(process.env.SF_NOTE_MAX_CHARS, 5_000, "SF_NOTE_MAX_CHARS"),
+      32_768,
+    ),
     timeoutMs: positiveInteger(process.env.SF_TIMEOUT_MS, 30_000, "SF_TIMEOUT_MS"),
     maxComments: positiveInteger(process.env.SF_MAX_COMMENTS, 100, "SF_MAX_COMMENTS"),
   }),

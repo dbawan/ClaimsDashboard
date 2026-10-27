@@ -1,3 +1,4 @@
+import { readAdvancedMdEra } from "./advancedMdEraRepository.js";
 import { config } from "../config.js";
 import {
   encounterCandidateFromEraReference,
@@ -8,7 +9,12 @@ import {
   invoiceProductText,
   PATIENT_INVOICE_CPT_MAPPINGS,
 } from "../lib/patientInvoiceMatching.js";
-import { AmbiguousClaimError, ClaimNotFoundError } from "../lib/errors.js";
+import {
+  AmbiguousClaimError,
+  ClaimNotFoundError,
+  PatientIdentityUnavailableError,
+  PatientNotFoundError,
+} from "../lib/errors.js";
 
 export { PATIENT_INVOICE_CPT_MAPPINGS } from "../lib/patientInvoiceMatching.js";
 
@@ -17,10 +23,14 @@ const CLAIM_STATUS = `\`${config.schemas.claimStatus}\`.\`${config.tables.claimS
 const PATIENT_INVOICES = `\`${config.schemas.claimStatus}\`.\`${config.tables.patientInvoices}\``;
 const EDI_835 = `\`${config.schemas.edi}\`.\`${config.tables.edi}\``;
 const EHR = `\`${config.schemas.ehr}\``;
+const PATIENT_INFO = `${EHR}.\`${config.tables.patientInfo}\``;
 
 const MAX_CANDIDATES = 30;
 const MAX_ROWS_PER_SOURCE = 25_000;
 const MAX_INVOICE_ROWS = 500;
+const PATIENT_CLAIM_PAGE_SIZE = 25;
+const MAX_PATIENT_CLAIM_RESULTS = 100;
+const MAX_PATIENT_SUGGESTIONS = 10;
 const INVOICE_COLUMNS = `
   id, vendor, InvoiceNumber, pt_FirstName, pt_LastName, DateOfService,
   RX, Description, ProductNumber, Amount, ProcedureName, Quantity,
@@ -31,6 +41,236 @@ const INVOICE_COLUMNS = `
 
 function unique(values) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function patientSearchResult(row) {
+  const firstName = String(row.firstName || "").trim();
+  const lastName = String(row.lastName || "").trim();
+  return Object.freeze({
+    patientId: String(row.patientId || "").trim(),
+    name: [firstName, lastName].filter(Boolean).join(" ")
+      || String(row.fullName || "").trim()
+      || "Unnamed patient",
+    dateOfBirth: String(row.dateOfBirth || "").slice(0, 10) || null,
+    chartNumber: String(row.chartNumber || "").trim() || null,
+    inactive: Boolean(row.inactiveAt),
+  });
+}
+
+export async function searchPatientsByName(session, query) {
+  const pattern = `${query}%`;
+  const rows = await session.select(
+    `SELECT
+            CAST(Patient_UID AS CHAR) AS patientId,
+            NULLIF(TRIM(FullName), '') AS fullName,
+            NULLIF(TRIM(FirstName), '') AS firstName,
+            NULLIF(TRIM(LastName), '') AS lastName,
+            DATE(DOB) AS dateOfBirth,
+            NULLIF(TRIM(ChartNumber), '') AS chartNumber,
+            Inactive AS inactiveAt
+       FROM ${PATIENT_INFO}
+      WHERE LicenseKey = ?
+        AND Patient_UID IS NOT NULL
+        AND (
+          UPPER(TRIM(FullName)) LIKE UPPER(?)
+          OR UPPER(TRIM(CONCAT_WS(' ', FirstName, LastName))) LIKE UPPER(?)
+          OR UPPER(TRIM(CONCAT_WS(' ', LastName, FirstName))) LIKE UPPER(?)
+          OR UPPER(TRIM(CONCAT(LastName, ', ', FirstName))) LIKE UPPER(?)
+          OR UPPER(TRIM(FirstName)) LIKE UPPER(?)
+          OR UPPER(TRIM(LastName)) LIKE UPPER(?)
+        )
+      ORDER BY
+        CASE
+          WHEN UPPER(TRIM(FullName)) = UPPER(?)
+            OR UPPER(TRIM(CONCAT_WS(' ', FirstName, LastName))) = UPPER(?) THEN 0
+          WHEN UPPER(TRIM(FirstName)) = UPPER(?)
+            OR UPPER(TRIM(LastName)) = UPPER(?) THEN 1
+          ELSE 2
+        END,
+        LastName ASC, FirstName ASC, DOB ASC, Patient_UID ASC
+      LIMIT ${MAX_PATIENT_SUGGESTIONS + 1}`,
+    [
+      config.ehr.licenseKey,
+      pattern, pattern, pattern, pattern, pattern, pattern,
+      query, query, query, query,
+    ],
+    { label: "claim.patient-name-search.suggestions" },
+  );
+
+  return Object.freeze({
+    query,
+    total: Math.min(rows.length, MAX_PATIENT_SUGGESTIONS),
+    hasMore: rows.length > MAX_PATIENT_SUGGESTIONS,
+    patients: Object.freeze(rows.slice(0, MAX_PATIENT_SUGGESTIONS).map(patientSearchResult)),
+  });
+}
+
+function patientClaimSummary(row) {
+  return Object.freeze({
+    claimId: normalizeIdentifier(row.claimId),
+    serviceDate: String(row.serviceDate || "").slice(0, 10) || null,
+    lastActivityDate: String(row.lastActivityDate || "").slice(0, 10) || null,
+    status: String(row.status || "").trim() || "Claim located",
+    payer: String(row.payer || "").trim() || null,
+    provider: String(row.provider || "").trim() || null,
+    location: String(row.location || "").trim() || null,
+    procedureCodes: Object.freeze(unique(
+      String(row.procedureCodes || "").split(",").map(normalizeIdentifier),
+    )),
+  });
+}
+
+function claimReferenceWhere(field, claimIds) {
+  return claimIds.map(() => `${field} LIKE ?`).join(" OR ");
+}
+
+export async function readPatientClaimSources(session, patientId, {
+  includeFinancials = false,
+  startDate = null,
+  endDate = null,
+  offset = 0,
+  procedureQuery = null,
+} = {}) {
+  const pageOffset = Number.isSafeInteger(offset) && offset >= 0 ? offset : 0;
+  const patientRows = await session.select(
+    `SELECT CAST(Patient_UID AS CHAR) AS patientId,
+            NULLIF(TRIM(FullName), '') AS fullName,
+            NULLIF(TRIM(FirstName), '') AS firstName,
+            NULLIF(TRIM(LastName), '') AS lastName,
+            DATE(DOB) AS dateOfBirth,
+            NULLIF(TRIM(ChartNumber), '') AS chartNumber,
+            Inactive AS inactiveAt
+       FROM ${PATIENT_INFO}
+      WHERE LicenseKey = ?
+        AND Patient_UID = ?
+      LIMIT 2`,
+    [config.ehr.licenseKey, patientId],
+    { label: "claim.patient-name-search.identity" },
+  );
+  if (patientRows.length !== 1) throw new PatientNotFoundError();
+
+  const serviceDateFilters = [
+    startDate ? "DATE(MIN(claim_rows.DATEOFSERVICE)) >= ?" : null,
+    endDate ? "DATE(MIN(claim_rows.DATEOFSERVICE)) <= ?" : null,
+  ].filter(Boolean);
+  const serviceDateParameters = [startDate, endDate].filter(Boolean);
+  const procedureFilter = procedureQuery
+    ? `
+            AND EXISTS (
+              SELECT 1
+                FROM ${TRANSACTIONS} AS procedure_rows
+               WHERE procedure_rows.ENCOUNTERID = claim_rows.ENCOUNTERID
+                 AND UPPER(TRIM(procedure_rows.PROCEDURECODE)) LIKE ?
+            )`
+    : "";
+  const procedureParameters = procedureQuery ? [`%${procedureQuery}%`] : [];
+  const serviceDateHaving = serviceDateFilters.length
+    ? `\n     HAVING ${serviceDateFilters.join("\n        AND ")}`
+    : "";
+  const totalRows = await session.select(
+    `SELECT COUNT(*) AS total
+       FROM (
+         SELECT claim_rows.ENCOUNTERID
+           FROM ${TRANSACTIONS} AS claim_rows
+          WHERE claim_rows.ENCOUNTERID IS NOT NULL
+            AND TRIM(CAST(claim_rows.PATIENTGUID AS CHAR)) = ?
+            AND UPPER(TRIM(claim_rows.EHR)) = UPPER(?)${procedureFilter}
+          GROUP BY claim_rows.ENCOUNTERID${serviceDateHaving}
+       ) AS matching_patient_claims`,
+    [patientId, config.ehr.transactionSource, ...procedureParameters, ...serviceDateParameters],
+    { label: "claim.patient-name-search.claim-count" },
+  );
+  const total = Math.max(0, Number(totalRows[0]?.total) || 0);
+  const summaryRows = await session.select(
+    `SELECT CAST(claim_rows.ENCOUNTERID AS CHAR) AS claimId,
+            DATE(MIN(claim_rows.DATEOFSERVICE)) AS serviceDate,
+            DATE(MAX(claim_rows.POSTINGDATE)) AS lastActivityDate,
+            SUBSTRING_INDEX(
+              GROUP_CONCAT(
+                NULLIF(TRIM(claim_rows.CLAIMTRANSACTIONTYPENAME), '')
+                ORDER BY claim_rows.POSTINGDATE DESC, claim_rows.CLAIMTRANSACTIONID DESC
+                SEPARATOR '|||'
+              ),
+              '|||',
+              1
+            ) AS status,
+            MAX(NULLIF(TRIM(claim_rows.PayerPlan1), '')) AS payer,
+            MAX(NULLIF(TRIM(claim_rows.Provider), '')) AS provider,
+            MAX(NULLIF(TRIM(claim_rows.Location), '')) AS location,
+            GROUP_CONCAT(
+              DISTINCT UPPER(TRIM(claim_rows.PROCEDURECODE))
+              ORDER BY UPPER(TRIM(claim_rows.PROCEDURECODE))
+              SEPARATOR ','
+            ) AS procedureCodes
+       FROM ${TRANSACTIONS} AS claim_rows
+      WHERE claim_rows.ENCOUNTERID IS NOT NULL
+        AND TRIM(CAST(claim_rows.PATIENTGUID AS CHAR)) = ?
+        AND UPPER(TRIM(claim_rows.EHR)) = UPPER(?)${procedureFilter}
+      GROUP BY claim_rows.ENCOUNTERID${serviceDateHaving}
+      ORDER BY serviceDate DESC, claimId DESC
+      LIMIT ${PATIENT_CLAIM_PAGE_SIZE + 1}
+      OFFSET ${pageOffset}`,
+    [patientId, config.ehr.transactionSource, ...procedureParameters, ...serviceDateParameters],
+    { label: "claim.patient-name-search.claims" },
+  );
+  const claimRows = summaryRows.slice(0, PATIENT_CLAIM_PAGE_SIZE).map(patientClaimSummary);
+  const claimIds = claimRows.map(({ claimId }) => claimId).filter(Boolean);
+
+  let transactions = [];
+  let claimStatus = [];
+  let edi835 = [];
+  let advancedMdEra = [];
+  if (includeFinancials && claimIds.length) {
+    const placeholders = claimIds.map(() => "?").join(", ");
+    const prefixes = claimIds.map((claimId) => `${claimId}%`);
+    [transactions, claimStatus, edi835, advancedMdEra] = await Promise.all([
+      session.select(
+        `SELECT *
+           FROM ${TRANSACTIONS}
+          WHERE ENCOUNTERID IN (${placeholders})
+          ORDER BY ENCOUNTERID ASC, POSTINGDATE ASC, CLAIMTRANSACTIONID ASC
+          LIMIT ${MAX_ROWS_PER_SOURCE + 1}`,
+        claimIds,
+        { label: "claim.patient-name-search.financial-transactions" },
+      ),
+      session.select(
+        `SELECT *
+           FROM ${CLAIM_STATUS}
+          WHERE ${claimReferenceWhere("PatientControlNumber", claimIds)}
+          ORDER BY CheckEftDate ASC, ImportedAtUtc ASC, ClaimStatusId ASC
+          LIMIT ${MAX_ROWS_PER_SOURCE + 1}`,
+        prefixes,
+        { label: "claim.patient-name-search.financial-claim-status" },
+      ),
+      session.select(
+        `SELECT *
+           FROM ${EDI_835}
+          WHERE ${claimReferenceWhere("patient_control_number", claimIds)}
+          ORDER BY payment_date ASC, service_date ASC, id ASC
+          LIMIT ${MAX_ROWS_PER_SOURCE + 1}`,
+        prefixes,
+        { label: "claim.patient-name-search.financial-edi-835" },
+      ),
+      readAdvancedMdEra(session, { claimIds }),
+    ]);
+    ensureComplete(transactions, "FlattenTransctions2", "selected patient");
+    ensureComplete(claimStatus, "ClaimStatus", "selected patient");
+    ensureComplete(edi835, "edi_835", "selected patient");
+  }
+
+  const hasMore = summaryRows.length > PATIENT_CLAIM_PAGE_SIZE
+    || pageOffset + claimRows.length < total;
+  return Object.freeze({
+    patient: patientSearchResult(patientRows[0]),
+    total,
+    hasMore,
+    nextOffset: hasMore ? pageOffset + claimRows.length : null,
+    claimRows: Object.freeze(claimRows),
+    transactions: Object.freeze(transactions),
+    claimStatus: Object.freeze(claimStatus),
+    edi835: Object.freeze(edi835),
+    advancedMdEra: Object.freeze(advancedMdEra),
+  });
 }
 
 async function exactEncounterCandidates(session, identifier) {
@@ -137,6 +377,145 @@ async function loadTransactions(session, claimId) {
     [claimId],
   );
   return ensureComplete(rows, "FlattenTransctions2", claimId);
+}
+
+async function loadPatientIdentity(session, claimId) {
+  return session.select(
+    `SELECT DISTINCT
+            NULLIF(TRIM(CAST(PATIENTGUID AS CHAR)), '') AS patientGuid,
+            NULLIF(TRIM(EHR), '') AS ehr,
+            NULLIF(TRIM(FIRSTNAME), '') AS firstName,
+            NULLIF(TRIM(LASTNAME), '') AS lastName,
+            DATE(DOB) AS dateOfBirth
+       FROM ${TRANSACTIONS}
+      WHERE ENCOUNTERID = ?
+      LIMIT 11`,
+    [claimId],
+    { label: "claim.patient-claim-lookup.identity" },
+  );
+}
+
+function patientLookupIdentity(rows) {
+  const patientGuidIdentities = new Map();
+  for (const row of rows) {
+    const patientGuid = String(row.patientGuid || "").trim();
+    const ehr = String(row.ehr || "").trim();
+    if (!patientGuid) continue;
+    const key = `${patientGuid.toLocaleUpperCase()}|${ehr.toLocaleUpperCase()}`;
+    if (!patientGuidIdentities.has(key)) patientGuidIdentities.set(key, { patientGuid, ehr });
+  }
+  const patientGuids = [...patientGuidIdentities.values()].slice(0, 10);
+  if (patientGuids.length) {
+    return {
+      whereClause: patientGuids.map(({ ehr }) => (
+        ehr
+          ? "(TRIM(CAST(PATIENTGUID AS CHAR)) = ? AND UPPER(TRIM(EHR)) = UPPER(?))"
+          : "TRIM(CAST(PATIENTGUID AS CHAR)) = ?"
+      )).join(" OR "),
+      parameters: patientGuids.flatMap(({ patientGuid, ehr }) => (
+        ehr ? [patientGuid, ehr] : [patientGuid]
+      )),
+      patientName: rows
+        .map((row) => [row.firstName, row.lastName].filter(Boolean).join(" ").trim())
+        .find(Boolean) || null,
+      matchMethod: "patient_guid",
+    };
+  }
+
+  const demographics = new Map();
+  for (const row of rows) {
+    const firstName = String(row.firstName || "").trim();
+    const lastName = String(row.lastName || "").trim();
+    const dateOfBirth = String(row.dateOfBirth || "").slice(0, 10);
+    if (!firstName || !lastName || !/^\d{4}-\d{2}-\d{2}$/.test(dateOfBirth)) continue;
+    const key = `${firstName.toLocaleUpperCase()}|${lastName.toLocaleUpperCase()}|${dateOfBirth}`;
+    if (!demographics.has(key)) demographics.set(key, { firstName, lastName, dateOfBirth });
+  }
+  const identities = [...demographics.values()].slice(0, 10);
+  if (!identities.length) throw new PatientIdentityUnavailableError();
+
+  return {
+    whereClause: identities.map(() => (
+      "(UPPER(TRIM(FIRSTNAME)) = UPPER(?) AND UPPER(TRIM(LASTNAME)) = UPPER(?) AND DATE(DOB) = ?)"
+    )).join(" OR "),
+    parameters: identities.flatMap(({ firstName, lastName, dateOfBirth }) => (
+      [firstName, lastName, dateOfBirth]
+    )),
+    patientName: `${identities[0].firstName} ${identities[0].lastName}`,
+    matchMethod: "name_and_date_of_birth",
+  };
+}
+
+function patientClaimResult(row, matchedCode) {
+  return Object.freeze({
+    claimId: normalizeIdentifier(row.claimId),
+    serviceDate: String(row.serviceDate || "").slice(0, 10) || null,
+    lastActivityDate: String(row.lastActivityDate || "").slice(0, 10) || null,
+    status: String(row.status || "").trim() || "Claim located",
+    payer: String(row.payer || "").trim() || null,
+    provider: String(row.provider || "").trim() || null,
+    location: String(row.location || "").trim() || null,
+    matchedCode,
+    procedureCodes: unique(String(row.procedureCodes || "").split(",").map(normalizeIdentifier)),
+  });
+}
+
+export async function searchPatientClaimsByProcedure(session, searchId, procedureCode) {
+  const claimId = await resolveTransactionClaimId(session, searchId);
+  const identityRows = await loadPatientIdentity(session, claimId);
+  if (!identityRows.length) throw new ClaimNotFoundError(searchId);
+
+  const identity = patientLookupIdentity(identityRows);
+  const matchedCode = normalizeIdentifier(procedureCode);
+  const rows = await session.select(
+    `SELECT CAST(claim_rows.ENCOUNTERID AS CHAR) AS claimId,
+            DATE(MIN(claim_rows.DATEOFSERVICE)) AS serviceDate,
+            DATE(MAX(claim_rows.POSTINGDATE)) AS lastActivityDate,
+            SUBSTRING_INDEX(
+              GROUP_CONCAT(
+                NULLIF(TRIM(claim_rows.CLAIMTRANSACTIONTYPENAME), '')
+                ORDER BY claim_rows.POSTINGDATE DESC, claim_rows.CLAIMTRANSACTIONID DESC
+                SEPARATOR '|||'
+              ),
+              '|||',
+              1
+            ) AS status,
+            MAX(NULLIF(TRIM(claim_rows.PayerPlan1), '')) AS payer,
+            MAX(NULLIF(TRIM(claim_rows.Provider), '')) AS provider,
+            MAX(NULLIF(TRIM(claim_rows.Location), '')) AS location,
+            GROUP_CONCAT(
+              DISTINCT UPPER(TRIM(claim_rows.PROCEDURECODE))
+              ORDER BY UPPER(TRIM(claim_rows.PROCEDURECODE))
+              SEPARATOR ','
+            ) AS procedureCodes
+       FROM ${TRANSACTIONS} AS claim_rows
+       JOIN (
+         SELECT ENCOUNTERID, MAX(DATEOFSERVICE) AS latestMatchingServiceDate
+           FROM ${TRANSACTIONS}
+          WHERE ENCOUNTERID IS NOT NULL
+            AND (${identity.whereClause})
+            AND UPPER(TRIM(PROCEDURECODE)) = ?
+          GROUP BY ENCOUNTERID
+          ORDER BY latestMatchingServiceDate DESC, ENCOUNTERID DESC
+          LIMIT ${MAX_PATIENT_CLAIM_RESULTS + 1}
+       ) AS matching_claims
+         ON matching_claims.ENCOUNTERID = claim_rows.ENCOUNTERID
+      GROUP BY claim_rows.ENCOUNTERID
+      ORDER BY serviceDate DESC, claimId DESC`,
+    [...identity.parameters, matchedCode],
+    { label: "claim.patient-claim-lookup.search" },
+  );
+
+  return Object.freeze({
+    patientName: identity.patientName,
+    matchedCode,
+    matchMethod: identity.matchMethod,
+    total: Math.min(rows.length, MAX_PATIENT_CLAIM_RESULTS),
+    hasMore: rows.length > MAX_PATIENT_CLAIM_RESULTS,
+    claims: Object.freeze(rows.slice(0, MAX_PATIENT_CLAIM_RESULTS).map((row) => (
+      patientClaimResult(row, matchedCode)
+    ))),
+  });
 }
 
 async function loadClaimStatus(session, claimId) {
@@ -477,11 +856,13 @@ export async function readClaimSources(session, searchId) {
 
   if (transactions.length === 0) throw new ClaimNotFoundError(searchId);
 
-  const [claimStatus, edi835, priorAuthorizations, invoiceLookup] = await Promise.all([
+  const [claimStatus, edi835, priorAuthorizations, invoiceLookup, advancedMdEra] = await Promise.all([
     loadClaimStatus(session, claimId),
     loadEdi835(session, claimId),
     loadPriorAuthorizations(session, claimId),
     loadPatientInvoices(session, transactions),
+    transactions.some((row) => row.EHR === config.ehr.transactionSource)
+      ? readAdvancedMdEra(session, { claimIds: [claimId] }) : [],
   ]);
 
   return Object.freeze({
@@ -489,6 +870,7 @@ export async function readClaimSources(session, searchId) {
     transactions,
     claimStatus,
     edi835,
+    advancedMdEra,
     priorAuthorizations,
     patientInvoices: invoiceLookup.rows,
     patientInvoiceLookup: Object.freeze({

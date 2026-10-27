@@ -1,0 +1,11 @@
+services:
+  profile:
+    build:
+      args:
+        APP_BASE_PATH: "${PRODUCTION_APP_BASE_PATH:-/dashboardapp}"
+    environment:
+      APP_ENV: production
+      APP_ORIGIN: "${PRODUCTION_APP_ORIGIN:-https://apps.unithera.com}"
+      APP_BASE_PATH: "${PRODUCTION_APP_BASE_PATH:-/dashboardapp}"
+    ports:
+      - "127.0.0.1:${PRODUCTION_PORT:-43127}:3000"

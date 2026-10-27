@@ -1,9 +1,11 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { openClaimWorkspace } from "../claims/claimNavigation.js";
-import { fetchHighLevelClaims, fetchHighLevelDashboard, fetchHighLevelQueue } from "./api.js";
+import { claimWorkspaceUrl } from "../claims/claimNavigation.js";
+import { fetchHighLevelClaimIcu, fetchHighLevelClaims, fetchHighLevelDashboard, fetchHighLevelQueue } from "./api.js";
 import { HighLevelDashboard } from "./HighLevelDashboard.jsx";
 import { QueueDetailDialog } from "./QueueDetailDialog.jsx";
+import { ClaimCptPayments } from "./ClaimCptPayments.jsx";
+import { ClaimIcu } from "./ClaimIcu.jsx";
 import {
   appointmentMinimumAge,
   buildHoverSnapshot,
@@ -17,6 +19,7 @@ import {
 } from "./highLevelModel.js";
 
 const MODES = Object.freeze([
+  ["icu", "Claim ICU"],
   ["dashboard", "Dashboard"],
   ["claims", "Claims"],
   ["unsubmitted", "Unsubmitted"],
@@ -24,7 +27,7 @@ const MODES = Object.freeze([
 ]);
 
 const SORT_OPTIONS = Object.freeze([
-  ["paid-percent", "Highest paid %"],
+  ["paid-percent", "Highest posted %"],
   ["youngest", "Youngest claim"],
   ["oldest", "Oldest claim"],
   ["billed", "Highest billed"],
@@ -83,7 +86,8 @@ function StatusLegend() {
         ["submitted", "Submitted"],
         ["pending", "Pending"],
         ["action", "Action"],
-        ["paid", "Paid"],
+        ["paid", "Posted"],
+        ["received", "Received"],
       ].map(([status, label]) => <span className={`status-${status}`} key={status}>{label}</span>)}
     </div>
   );
@@ -91,6 +95,7 @@ function StatusLegend() {
 
 function ClaimHoverBubble({ claim, snapshot, event, position, id }) {
   const eventStatus = event?.status || snapshot.status;
+  const thresholdPercent = claim.paidThresholdPercent || 50;
   const bubble = (
     <aside
       className="claim-hover-bubble"
@@ -108,7 +113,9 @@ function ClaimHoverBubble({ claim, snapshot, event, position, id }) {
         <div><dt>Service</dt><dd>{formatShortDate(claim.serviceDate)}</dd></div>
         <div><dt>Event</dt><dd>{event?.label || snapshot.lastEvent?.label || "No activity yet"}</dd></div>
         <div><dt>Billed</dt><dd>{moneyFormatter.format(claim.billedAmount || 0)}</dd></div>
-        <div><dt>Paid</dt><dd>{moneyFormatter.format(claim.paidAmount || 0)} · {Math.round((claim.paidPercent || 0) * 100)}%</dd></div>
+        <div><dt>Posted payment</dt><dd>{moneyFormatter.format(claim.paidAmount || 0)} · {Math.round((claim.paidPercent || 0) * 100)}%</dd></div>
+        <div><dt>Payment received</dt><dd>{moneyFormatter.format(claim.receivedAmount || 0)}</dd></div>
+        <div><dt>{thresholdPercent}% posted</dt><dd>{claim.daysToPaid != null ? `${claim.daysToPaid} days · ${formatShortDate(claim.paidThresholdDate)}` : "Not reached"}</dd></div>
       </dl>
       <div className="claim-hover-cpt-heading"><span>CPT through this date</span><strong>{snapshot.procedures.length}</strong></div>
       {snapshot.procedures.length ? (
@@ -117,7 +124,7 @@ function ClaimHoverBubble({ claim, snapshot, event, position, id }) {
             <li key={procedure.procedure}>
               <strong>{procedure.procedure}</strong>
               <span>{moneyFormatter.format(procedure.charge)} charged</span>
-              <b className={procedure.paid < 0 ? "amount-negative" : "amount-positive"}>{moneyFormatter.format(procedure.paid)} paid</b>
+              <b className={procedure.paid < 0 ? "amount-negative" : "amount-positive"}>{moneyFormatter.format(procedure.paid)} posted</b>
             </li>
           ))}
         </ol>
@@ -131,8 +138,10 @@ function ClaimTrack({ claim, start, end }) {
   const track = useMemo(() => buildTrack(claim, start, end), [claim, start, end]);
   const currentPercent = positionForDate(track.currentDate, start, end);
   const [hover, setHover] = useState(null);
+  const [expanded, setExpanded] = useState(false);
   const trackRef = useRef(null);
   const tooltipId = useId();
+  const paymentsId = useId();
   const snapshot = useMemo(
     () => hover ? buildHoverSnapshot(claim, hover.date) : null,
     [claim, hover],
@@ -140,6 +149,13 @@ function ClaimTrack({ claim, start, end }) {
   const currentStatusLabel = claim.currentStatus === "action" && claim.issueLabel
     ? claim.issueLabel
     : STATUS_LABELS[claim.currentStatus] || claim.currentStatus;
+  const thresholdPercent = claim.paidThresholdPercent || 50;
+  const hasPaidTiming = claim.daysToPaid != null;
+  const paidTimingTitle = claim.paidThresholdAmount == null
+    ? "Paid timing is unavailable because this claim has no latest charge"
+    : hasPaidTiming
+      ? `Reached ${thresholdPercent}% posted (${moneyFormatter.format(claim.paidThresholdAmount)}) on ${formatShortDate(claim.paidThresholdDate)}, ${claim.daysToPaid} day${claim.daysToPaid === 1 ? "" : "s"} after claim creation`
+      : `Has not reached the ${thresholdPercent}% posted threshold (${moneyFormatter.format(claim.paidThresholdAmount)})`;
 
   function bubblePosition(clientX, clientY) {
     const gap = 14;
@@ -164,50 +180,30 @@ function ClaimTrack({ claim, start, end }) {
   }
 
   function updateHover(clientX, clientY) {
+    if (expanded) return;
     const bounds = trackRef.current?.getBoundingClientRect();
     if (!bounds) return;
     const percent = ((clientX - bounds.left) / Math.max(1, bounds.width)) * 100;
     showEvent(eventIndexForPosition(percent, track.markers.length), clientX, clientY);
   }
 
+  function togglePayments() {
+    setHover(null);
+    setExpanded((current) => !current);
+  }
+
   return (
     <li
-      className={`high-level-claim-row${hover ? " claim-row-expanded" : ""}`}
-      role="link"
-      tabIndex="0"
-      title={`Open claim ${claim.claimId} in a new tab`}
-      aria-label={`Open claim ${claim.claimId} in a new tab`}
-      aria-describedby={hover ? tooltipId : undefined}
-      onClick={() => openClaimWorkspace(claim.claimId)}
-      onPointerMove={(event) => updateHover(event.clientX, event.clientY)}
-      onPointerLeave={() => setHover(null)}
-      onFocus={() => {
-        const bounds = trackRef.current?.getBoundingClientRect();
-        if (bounds) {
-          const index = Math.max(0, track.markers.length - 1);
-          const x = bounds.left + (equalEventPosition(index, track.markers.length) / 100) * bounds.width;
-          showEvent(index, x, bounds.top + bounds.height / 2);
-        }
-      }}
-      onBlur={() => setHover(null)}
-      onKeyDown={(event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          openClaimWorkspace(claim.claimId);
-          return;
-        }
-        if (!['ArrowLeft', 'ArrowRight'].includes(event.key) || !track.markers.length) return;
-        event.preventDefault();
-        const direction = event.key === 'ArrowRight' ? 1 : -1;
-        const index = Math.max(0, Math.min(track.markers.length - 1, (hover?.eventIndex ?? 0) + direction));
-        const bounds = trackRef.current?.getBoundingClientRect();
-        if (bounds) {
-          const x = bounds.left + (equalEventPosition(index, track.markers.length) / 100) * bounds.width;
-          showEvent(index, x, bounds.top + bounds.height / 2);
-        }
-      }}
+      className={`high-level-claim-row${hover ? " claim-row-expanded" : ""}${expanded ? " claim-row-payments-open" : ""}`}
     >
-      <div className="high-level-claim-label">
+      <a
+        className="high-level-claim-label"
+        href={claimWorkspaceUrl(claim.claimId)}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={`Open claim ${claim.claimId} in a new tab`}
+        aria-label={`Open claim ${claim.claimId} in a new tab`}
+      >
         <div><strong>{claim.claimId}</strong><span className={`claim-current-status status-${claim.currentStatus}`} title={currentStatusLabel}>{currentStatusLabel}</span></div>
         <small className="claim-patient-invoices">
           <span title={claim.patientName || "Patient not provided"}>{claim.patientName || "Patient not provided"}</span>
@@ -220,12 +216,56 @@ function ClaimTrack({ claim, start, end }) {
             {claim.invoiceMatchAmbiguous ? "⚑ " : ""}{claim.invoiceRowCount || 0} invoice row{claim.invoiceRowCount === 1 ? "" : "s"}
           </b>
         </small>
-        <small title={claim.payer || "Payer not provided"}>{claim.payer || "Payer not provided"}</small>
-      </div>
+        <small className="claim-payer-charge">
+          <span title={claim.payer || "Payer not provided"}>{claim.payer || "Payer not provided"}</span>
+          <b title={`Latest charge: ${moneyFormatter.format(claim.latestChargeAmount || 0)}`}>
+            <span>Latest </span>{moneyFormatter.format(claim.latestChargeAmount || 0)}
+          </b>
+        </small>
+        <small className={`claim-paid-age${hasPaidTiming ? " claim-paid-age-reached" : ""}`} title={paidTimingTitle}>
+          <span>{thresholdPercent}% posted</span>
+          <b>{hasPaidTiming ? `Paid in ${claim.daysToPaid}d` : "Not reached"}</b>
+        </small>
+      </a>
       <div
         className="high-level-track"
         ref={trackRef}
-        aria-label={`Claim ${claim.claimId}, current status ${currentStatusLabel}`}
+        role="button"
+        tabIndex={0}
+        aria-label={`${expanded ? "Hide" : "Show"} CPT payments for claim ${claim.claimId}`}
+        aria-expanded={expanded}
+        aria-controls={paymentsId}
+        aria-describedby={hover ? tooltipId : undefined}
+        onClick={togglePayments}
+        onPointerMove={(event) => updateHover(event.clientX, event.clientY)}
+        onPointerLeave={() => setHover(null)}
+        onFocus={() => {
+          if (expanded) return;
+          const bounds = trackRef.current?.getBoundingClientRect();
+          if (bounds) {
+            const index = Math.max(0, track.markers.length - 1);
+            const x = bounds.left + (equalEventPosition(index, track.markers.length) / 100) * bounds.width;
+            showEvent(index, x, bounds.top + bounds.height / 2);
+          }
+        }}
+        onBlur={() => setHover(null)}
+        onKeyDown={(event) => {
+          if (["Enter", " "].includes(event.key)) {
+            event.preventDefault();
+            togglePayments();
+            return;
+          }
+          if (event.key === "Escape") { setHover(null); setExpanded(false); return; }
+          if (expanded || !["ArrowLeft", "ArrowRight"].includes(event.key) || !track.markers.length) return;
+          event.preventDefault();
+          const direction = event.key === "ArrowRight" ? 1 : -1;
+          const index = Math.max(0, Math.min(track.markers.length - 1, (hover?.eventIndex ?? 0) + direction));
+          const bounds = trackRef.current?.getBoundingClientRect();
+          if (bounds) {
+            const x = bounds.left + (equalEventPosition(index, track.markers.length) / 100) * bounds.width;
+            showEvent(index, x, bounds.top + bounds.height / 2);
+          }
+        }}
       >
         {track.segments.map((segment, index) => {
           const left = positionForDate(segment.start, start, end);
@@ -273,7 +313,9 @@ function ClaimTrack({ claim, start, end }) {
             );
           })}
         </div>
+        <span className="claim-expand-hint" aria-hidden="true">{expanded ? "Hide CPT payments" : "CPT payments"}<b>{expanded ? "⌃" : "⌄"}</b></span>
       </div>
+      {expanded ? <ClaimCptPayments claim={claim} id={paymentsId} /> : null}
       {hover && snapshot ? (
         <ClaimHoverBubble claim={claim} snapshot={snapshot} event={track.markers[hover.eventIndex]} position={hover} id={tooltipId} />
       ) : null}
@@ -281,13 +323,34 @@ function ClaimTrack({ claim, start, end }) {
   );
 }
 
-function ClaimOverview({ data }) {
+export function ClaimOverview({ data, onPageChange }) {
   const ticks = axisTicks(data.start, data.end);
+  const firstClaim = data.total ? data.offset + 1 : 0;
+  const lastClaim = data.offset + data.claims.length;
   return (
     <section className="high-level-chart" aria-label="Claim status over time">
       <header className="high-level-chart-header">
-        <span><strong>{data.claims.length}</strong> / {data.total} claims</span>
-        <small className="claim-hover-hint">Hover a row to spread its events evenly</small>
+        <span><strong>{firstClaim}–{lastClaim}</strong> of {data.total} claims</span>
+        <small className="claim-hover-hint">Hover for events · Click a row for CPT payments</small>
+        <nav className="claim-pagination" aria-label="Claim pages">
+          <button
+            type="button"
+            disabled={data.page <= 1}
+            aria-label="Previous claim page"
+            onClick={() => onPageChange(data.page - 1)}
+          >
+            ‹
+          </button>
+          <span>Page <strong>{data.page}</strong> of {data.totalPages}</span>
+          <button
+            type="button"
+            disabled={data.page >= data.totalPages}
+            aria-label="Next claim page"
+            onClick={() => onPageChange(data.page + 1)}
+          >
+            ›
+          </button>
+        </nav>
         <StatusLegend />
       </header>
       <div className="high-level-axis-row" aria-hidden="true">
@@ -299,7 +362,7 @@ function ClaimOverview({ data }) {
       <ol className="high-level-claim-list">
         {data.claims.map((claim) => <ClaimTrack claim={claim} start={data.start} end={data.end} key={claim.claimId} />)}
       </ol>
-      {!data.claims.length ? <p className="high-level-empty">No claim activity in this range.</p> : null}
+      {!data.claims.length ? <p className="high-level-empty">{data.procedureQuery ? `No claims match CPT / HCPCS “${data.procedureQuery}” in this range.` : "No claim activity in this range."}</p> : null}
     </section>
   );
 }
@@ -479,16 +542,23 @@ function AgingQueue({ data, mode, options, onOptionsChange, onItemOpen }) {
 
 export function HighLevelPage() {
   const initial = useMemo(initialDates, []);
-  const [mode, setMode] = useState("dashboard");
+  const [mode, setMode] = useState("icu");
   const [draftDates, setDraftDates] = useState(initial);
   const [range, setRange] = useState(initial);
   const [limit, setLimit] = useState(25);
+  const [page, setPage] = useState(1);
   const [sort, setSort] = useState("youngest");
+  const [icuSort, setIcuSort] = useState("deadline");
+  const [includePastDeadline, setIncludePastDeadline] = useState(false);
+  const [draftIcuProcedureQuery, setDraftIcuProcedureQuery] = useState("");
+  const [icuProcedureQuery, setIcuProcedureQuery] = useState("");
+  const [draftProcedureQuery, setDraftProcedureQuery] = useState("");
+  const [procedureQuery, setProcedureQuery] = useState("");
   const [rangeMode, setRangeMode] = useState("30");
   const [customDays, setCustomDays] = useState(14);
   const [dashboardBillingMode, setDashboardBillingMode] = useState("all");
   const [dashboardPayers, setDashboardPayers] = useState([]);
-  const [dashboardSeriesVisibility, setDashboardSeriesVisibility] = useState({ billed: true, paid: true, recouped: true });
+  const [dashboardSeriesVisibility, setDashboardSeriesVisibility] = useState({ billed: true, posted: true, paid: true, recouped: true });
   const [queueOptions, setQueueOptions] = useState({
     unsubmitted: { order: "oldest", query: "", scope: "all", ageFilter: "all", customAgeDays: 14 },
     "no-response": { order: "oldest", query: "", scope: "all" },
@@ -510,18 +580,26 @@ export function HighLevelPage() {
     setLoading(true);
     setError("");
     setData(null);
-    const request = mode === "dashboard"
-      ? fetchHighLevelDashboard({ ...range, billingMode: dashboardBillingMode, payers: dashboardPayers }, { signal: controller.signal })
-      : mode === "claims"
-        ? fetchHighLevelClaims({ ...range, limit, sort }, { signal: controller.signal })
-        : fetchHighLevelQueue(mode, { ...queueOptions[mode], ...range }, { signal: controller.signal });
+    const request = mode === "icu"
+      ? fetchHighLevelClaimIcu({
+        limit,
+        page,
+        sort: icuSort,
+        includePastDeadline,
+        procedureQuery: icuProcedureQuery,
+      }, { signal: controller.signal })
+      : mode === "dashboard"
+        ? fetchHighLevelDashboard({ ...range, billingMode: dashboardBillingMode, payers: dashboardPayers, procedureQuery }, { signal: controller.signal })
+        : mode === "claims"
+          ? fetchHighLevelClaims({ ...range, limit, page, sort, procedureQuery }, { signal: controller.signal })
+          : fetchHighLevelQueue(mode, { ...queueOptions[mode], ...range }, { signal: controller.signal });
     request.then((payload) => setData({ mode, payload })).catch((nextError) => {
       if (nextError.name !== "AbortError") setError(nextError.message);
     }).finally(() => {
       if (requestRef.current === controller) setLoading(false);
     });
     return () => controller.abort();
-  }, [mode, range, limit, sort, retryKey, activeQueueOrder, activeQueueScope, dashboardBillingMode, dashboardPayers]);
+  }, [mode, range, limit, page, sort, icuSort, includePastDeadline, icuProcedureQuery, retryKey, activeQueueOrder, activeQueueScope, dashboardBillingMode, dashboardPayers, procedureQuery]);
 
   useEffect(() => setQueueDetail(null), [mode]);
 
@@ -534,7 +612,9 @@ export function HighLevelPage() {
       setError(rangeMode === "custom-days" ? "Enter a number of days from 1 to 3,650." : "Choose a valid start and end date.");
       return;
     }
-    setDashboardPayers([]);
+    if (nextRange.start !== range.start || nextRange.end !== range.end) setDashboardPayers([]);
+    setPage(1);
+    if (!isQueue) setProcedureQuery(draftProcedureQuery.trim().toUpperCase());
     setRange(nextRange);
   }
 
@@ -549,14 +629,84 @@ export function HighLevelPage() {
               aria-selected={mode === value}
               className={mode === value ? "high-level-mode-active" : ""}
               key={value}
-              onClick={() => setMode(value)}
+              onClick={() => {
+                setMode(value);
+                setPage(1);
+              }}
             >
               {label}
             </button>
           ))}
         </div>
 
+        {mode === "icu" ? (
+          <form
+            className="high-level-filters claim-icu-filters"
+            aria-label="Claim ICU controls"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setPage(1);
+              setIcuProcedureQuery(draftIcuProcedureQuery.trim().toUpperCase());
+            }}
+          >
+            <label className="claim-icu-cpt-search">
+              <span>CPT / HCPCS</span>
+              <input
+                type="search"
+                value={draftIcuProcedureQuery}
+                onChange={(event) => setDraftIcuProcedureQuery(event.target.value.toUpperCase())}
+                placeholder="Exact code"
+                aria-label="Search Claim ICU by exact CPT or HCPCS code"
+                maxLength={20}
+                pattern="[A-Za-z0-9.\-]{1,20}"
+                autoComplete="off"
+                autoCapitalize="characters"
+                spellCheck={false}
+              />
+            </label>
+            <label className="claim-icu-priority">
+              <span>Prioritize</span>
+              <select value={icuSort} onChange={(event) => { setPage(1); setIcuSort(event.target.value); }}>
+                <option value="deadline">Filing limit days left</option>
+                <option value="cpt-charged">Highest CPT billed amount</option>
+              </select>
+            </label>
+            <label className="high-level-row-count">
+              <span>Rows</span>
+              <select value={limit} onChange={(event) => { setPage(1); setLimit(Number(event.target.value)); }}>
+                <option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option>
+              </select>
+            </label>
+            <label className="claim-icu-include-past">
+              <input
+                type="checkbox"
+                checked={includePastDeadline}
+                onChange={(event) => { setPage(1); setIncludePastDeadline(event.target.checked); }}
+              />
+              <span>Include past filing limits</span>
+            </label>
+            <button type="submit">Search</button>
+          </form>
+        ) : (
         <form className="high-level-filters" onSubmit={applyRange}>
+          {!isQueue ? (
+            <label className="high-level-procedure-search">
+              <span>CPT / HCPCS</span>
+              <input
+                type="search"
+                value={draftProcedureQuery}
+                onChange={(event) => setDraftProcedureQuery(event.target.value.toUpperCase())}
+                placeholder="Code or partial code"
+                aria-label="Search CPT or HCPCS code"
+                title="Enter a full or partial code, then select Apply. Clear the field and apply to show all codes."
+                maxLength={20}
+                pattern="[A-Za-z0-9.\-]{1,20}"
+                autoComplete="off"
+                autoCapitalize="characters"
+                spellCheck={false}
+              />
+            </label>
+          ) : null}
           <label className="high-level-range"><span>Range</span><select value={rangeMode} onChange={(event) => setRangeMode(event.target.value)}>{RANGE_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
           {rangeMode === "custom-dates" ? (
             <>
@@ -565,14 +715,15 @@ export function HighLevelPage() {
             </>
           ) : null}
           {rangeMode === "custom-days" ? <label className="high-level-days"><span>Days</span><input type="number" min="1" max="3650" inputMode="numeric" value={customDays} onChange={(event) => setCustomDays(event.target.value)} /></label> : null}
-          {mode === "claims" ? <label className="high-level-row-count"><span>Rows</span><select value={limit} onChange={(event) => setLimit(Number(event.target.value))}><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label> : null}
-          {mode === "claims" ? <label className="high-level-sort"><span>Sort</span><select value={sort} onChange={(event) => setSort(event.target.value)}>{SORT_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label> : null}
+          {mode === "claims" ? <label className="high-level-row-count"><span>Rows</span><select value={limit} onChange={(event) => { setPage(1); setLimit(Number(event.target.value)); }}><option value="10">10</option><option value="25">25</option><option value="50">50</option><option value="100">100</option></select></label> : null}
+          {mode === "claims" ? <label className="high-level-sort"><span>Sort</span><select value={sort} onChange={(event) => { setPage(1); setSort(event.target.value); }}>{SORT_OPTIONS.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label> : null}
           <button type="submit">Apply</button>
         </form>
+        )}
       </header>
 
       <div className="high-level-content" aria-live="polite" aria-busy={loading}>
-        {loading ? <div className="high-level-state"><span className="high-level-spinner" />{mode === "dashboard" ? "Aggregating financial activity" : mode === "unsubmitted" ? "Finding appointments without claims" : mode === "no-response" ? "Checking claims awaiting responses" : "Loading claims"}</div> : null}
+        {loading ? <div className="high-level-state"><span className="high-level-spinner" />{mode === "icu" ? "Prioritizing claims for review" : mode === "dashboard" ? "Aggregating financial activity" : mode === "unsubmitted" ? "Finding appointments without claims" : mode === "no-response" ? "Checking claims awaiting responses" : "Loading claims"}</div> : null}
         {!loading && error ? (
           <div className="high-level-state high-level-state-error">
             <strong>Unable to load this view</strong>
@@ -597,7 +748,8 @@ export function HighLevelPage() {
             }))}
           />
         ) : null}
-        {!loading && !error && currentData && mode === "claims" ? <ClaimOverview data={currentData} /> : null}
+        {!loading && !error && currentData && mode === "claims" ? <ClaimOverview data={currentData} onPageChange={setPage} /> : null}
+        {!loading && !error && currentData && mode === "icu" ? <ClaimIcu data={currentData} onPageChange={setPage} /> : null}
         {!loading && !error && currentData && isQueue ? (
           <AgingQueue
             data={currentData}
